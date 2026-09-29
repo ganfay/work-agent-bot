@@ -4,6 +4,8 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"scraper/internal/broker"
@@ -19,23 +21,33 @@ func main() {
 
 	// 2. Initialize structured logging with file rotation (slog + lumberjack)
 	logger.Setup(cfg.Scraper.LogPath)
-	slog.Info("starting scraper service")
+	slog.Info("starting scraper daemon")
 
-	// 3. Initialize Database Repository
+	// 3. Graceful shutdown setup via signal.NotifyContext
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 4. Initialize Database Repository
 	repo, err := repository.NewJobRepository(cfg.DSN())
 	if err != nil {
 		slog.Error("repository initialization failed", "error", err)
 		os.Exit(1)
 	}
-	defer repo.Close()
+	defer func() {
+		slog.Info("closing database connection pool...")
+		repo.Close()
+	}()
 
-	// 4. Initialize RabbitMQ Broker
+	// 5. Initialize RabbitMQ Broker
 	mq, err := broker.NewRabbitMQ(cfg.URL())
 	if err != nil {
 		slog.Error("broker initialization failed", "error", err)
 		os.Exit(1)
 	}
-	defer mq.Close()
+	defer func() {
+		slog.Info("closing rabbitmq connection and channels...")
+		mq.Close()
+	}()
 
 	queueName := "new_vacancies"
 	_, err = mq.DeclareQueue(queueName)
@@ -44,11 +56,48 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 5. Fetch jobs from Djinni RSS
+	// 6. Run the first scrape iteration immediately on startup
+	slog.Info("executing initial scrape cycle")
+	runScrapeIteration(ctx, cfg, repo, mq, queueName)
+
+	// 7. Background ticker loop for periodic scraping
+	ticker := time.NewTicker(cfg.Scraper.Interval)
+	defer ticker.Stop()
+
+	slog.Info("scraper service entered daemon mode", "interval", cfg.Scraper.Interval.String())
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("termination signal received: starting graceful shutdown...")
+			// When returningч, all defers (ticker.Stop, mq.Close, repo.Close) execute cleanly
+			slog.Info("scraper daemon stopped successfully.")
+			return
+
+		case <-ticker.C:
+			slog.Info("ticker triggered periodic scrape cycle")
+			runScrapeIteration(ctx, cfg, repo, mq, queueName)
+		}
+	}
+}
+
+// runScrapeIteration fetches jobs, deduplicates them in Postgres, and publishes new ones to RabbitMQ
+func runScrapeIteration(
+	ctx context.Context,
+	cfg *config.Config,
+	repo *repository.JobRepository,
+	mq *broker.RabbitMQ,
+	queueName string,
+) {
+	// Check if the service was already requested to shut down
+	if ctx.Err() != nil {
+		return
+	}
+
 	jobs, err := djinni.FetchJobs(cfg.Scraper.RSSURL)
 	if err != nil {
-		slog.Error("failed to fetch jobs", "error", err)
-		os.Exit(1)
+		slog.Error("failed to fetch jobs from djinni", "error", err)
+		return
 	}
 
 	if len(jobs) == 0 {
@@ -56,11 +105,15 @@ func main() {
 		return
 	}
 
-	// 6. Deduplicate and Publish
 	newJobsCount := 0
-	ctx := context.Background()
 
 	for _, job := range jobs {
+		// Stop processing if shutdown signal was intercepted mid-iteration
+		if ctx.Err() != nil {
+			slog.Warn("scrape iteration interrupted by shutdown signal")
+			return
+		}
+
 		isNew, err := repo.SaveJobIfNotExists(ctx, job)
 		if err != nil {
 			slog.Error("failed to save job to database", "guid", job.GUID, "error", err)

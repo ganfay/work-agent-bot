@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 )
@@ -23,21 +24,25 @@ type Config struct {
 		Port     string `env:"RMQ_PORT" env-default:"5672"`
 	}
 	Scraper struct {
-		RSSURL  string `env:"DJINNI_RSS_URL" env-required:"true"`
-		LogPath string `env:"LOG_PATH" env-default:"logs/scraper.log"`
+		RSSURL   string        `env:"DJINNI_RSS_URL" env-required:"true"`
+		LogPath  string        `env:"LOG_PATH" env-default:"logs/scraper.log"`
+		Interval time.Duration `env:"SCRAPE_INTERVAL" env-default:"15m"`
 	}
 }
 
+// DSN builds the PostgreSQL connection string
 func (c *Config) DSN() string {
 	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
 		c.Database.User, c.Database.Password, c.Database.Host, c.Database.Port, c.Database.Name)
 }
 
+// URL builds the RabbitMQ connection string
 func (c *Config) URL() string {
 	return fmt.Sprintf("amqp://%s:%s@%s:%s/",
 		c.RabbitMQ.User, c.RabbitMQ.Password, c.RabbitMQ.Host, c.RabbitMQ.Port)
 }
 
+// LoadConfig parses the .env file and populates the Config struct
 func LoadConfig(envPath string) *Config {
 	var cfg Config
 	err := cleanenv.ReadConfig(envPath, &cfg)
