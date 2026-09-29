@@ -1,0 +1,8 @@
+CREATE TABLE IF NOT EXISTS jobs (
+    id SERIAL PRIMARY KEY,
+    guid VARCHAR UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT,
+    status VARCHAR DEFAULT 'new',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
