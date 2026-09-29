@@ -1,3 +1,6 @@
 .env
 .idea
 logs
+_pycache_
+.venv
+/ai_worker/.venv
