@@ -1,4 +1,4 @@
-w # Detect virtual environment if it exists, otherwise fall back to system python
+# Detect virtual environment if it exists, otherwise fall back to system python
 VENV := .venv
 PYTHON := $(if $(wildcard $(VENV)/bin/python),$(VENV)/bin/python,python3)
 PIP := $(if $(wildcard $(VENV)/bin/pip),$(VENV)/bin/pip,pip)
