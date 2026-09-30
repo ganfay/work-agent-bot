@@ -18,12 +18,10 @@ def setup_logger(log_file_path: str = "logs/ai_worker.log", level: int = logging
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    # 1. Stdout console handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-    # 2. Rotating file handler (10MB limit, 3 backups like lumberjack)
     file_handler = RotatingFileHandler(
         filename=log_file_path,
         maxBytes=10 * 1024 * 1024,

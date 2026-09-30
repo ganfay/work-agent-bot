@@ -19,7 +19,10 @@ class Config:
         self.rmq_host = os.getenv("RMQ_HOST", "localhost")
         self.rmq_port = os.getenv("RMQ_PORT", "5672")
 
-        # 3. Worker Settings
+        # 3. AI Settings
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+
+        # 4. Worker Settings
         self.queue_name = "new_vacancies"
         self.log_path = "logs/ai_worker.log"
 
