@@ -1,0 +1,47 @@
+{
+  "target_role": "Junior / Junior+ Go Backend Developer",
+  "experience_level": "~1 year commercial / intensive pet-project experience",
+  "baseline_prompt": "CANDIDATE BASELINE:\n- Target Role: Junior / Junior+ Go Backend Developer (~1 year experience, SplitCore pet project).\n- Core Tech Stack: Go (Golang), PostgreSQL, pgxpool, RabbitMQ, Docker, Clean Architecture, REST API, Linux.\n- Additional: Learning Python (AI agents, basic RAG).\n- Gaps / No Commercial Experience: Kubernetes (K8s), Apache Kafka, gRPC, high-scale microservices, AWS cloud architecture, complex CI/CD.\n- HARD REJECT CRITERIA (Instant SKIP): Senior positions (3+ years required), non-Go primary languages (Java, PHP, C#, C++, Node.js), on-site outside Kyiv.",
+  "knowledge_chunks": [
+    {
+      "project": "SplitCore",
+      "category": "MessageBroker",
+      "content": "Asynchronous event-driven architecture using RabbitMQ (amqp091-go). Implemented publisher and consumer channels with durable queues and acknowledgments (ACK/NACK) for instant Telegram user notifications."
+    },
+    {
+      "project": "SplitCore",
+      "category": "Database",
+      "content": "Production PostgreSQL integration with pgxpool v5 in Golang. Implemented relational schema, connection pooling, SQL migrations, and strict ACID transaction safety for user balance transfers."
+    },
+    {
+      "project": "SplitCore",
+      "category": "Architecture",
+      "content": "Clean Architecture / Domain-Driven Design (DDD) in Go. Decoupled domain business entities, repository interfaces, database adapters, and usecase interactors for zero circular dependencies."
+    },
+    {
+      "project": "SplitCore",
+      "category": "DevOps",
+      "content": "Containerization with Docker and Docker Compose. Multi-stage Go builds, volume persistence for PostgreSQL data, and isolated network bridges."
+    },
+    {
+      "project": "Freelance Agent",
+      "category": "Networking",
+      "content": "High-performance RSS parser in Go using gofeed library. Downloads XML feeds from Djinni, parses vacancy items, and implements atomic deduplication in PostgreSQL via ON CONFLICT (guid) DO NOTHING."
+    },
+    {
+      "project": "Freelance Agent",
+      "category": "TelegramBot",
+      "content": "Interactive Human-in-the-Loop Telegram Bot built with gopkg.in/telebot.v4 in Golang. Handles inline callback buttons, dynamic message editing, feedback routing, and tap-to-copy code formatting."
+    },
+    {
+      "project": "Freelance Agent",
+      "category": "Logging & Concurrency",
+      "content": "Structured logging in Go using standard log/slog with lumberjack file rotation. Graceful shutdown daemon with signal.NotifyContext handling SIGINT and SIGTERM without race conditions."
+    },
+    {
+      "project": "Freelance Agent",
+      "category": "AI & Python",
+      "content": "Deterministic multi-agent pipeline in Python using Google Gemini API. Structured Outputs enforced via Pydantic schemas, RabbitMQ prefetch QoS consumer with pika."
+    }
+  ]
+}

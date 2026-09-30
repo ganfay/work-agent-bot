@@ -1,6 +1,7 @@
 services:
   db:
     image: pgvector/pgvector:pg16
+    container_name: bidder_db
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${PG_USER}
@@ -10,9 +11,16 @@ services:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PG_USER} -d ${PG_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
 
   rabbitmq:
     image: rabbitmq:4.3.6-management-alpine
+    container_name: bidder_rabbitmq
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: ${RMQ_USER}
@@ -20,7 +28,61 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  scraper:
+    build:
+      context: ./scraper
+      dockerfile: Dockerfile
+    container_name: bidder_scraper
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PG_HOST: db
+      RMQ_HOST: rabbitmq
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  ai_worker:
+    build:
+      context: ./ai_worker
+      dockerfile: Dockerfile
+    container_name: bidder_ai_worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      PG_HOST: db
+      RMQ_HOST: rabbitmq
+    volumes:
+      - ./candidate_profile.json:/app/candidate_profile.json:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  tg_bot:
+    build:
+      context: ./tg_bot
+      dockerfile: Dockerfile
+    container_name: bidder_tg_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      RMQ_HOST: rabbitmq
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
 
 volumes:
   db_data:
-

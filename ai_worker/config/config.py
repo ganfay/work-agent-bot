@@ -1,7 +1,17 @@
 import os
+import json
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv("../.env")
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent.parent
+
+# Check potential .env locations
+ENV_PATH = PROJECT_ROOT / ".env"
+if ENV_PATH.exists():
+    load_dotenv(ENV_PATH)
+else:
+    load_dotenv()
 
 
 class Config:
@@ -25,6 +35,25 @@ class Config:
         # 4. Worker Settings
         self.queue_name = "new_vacancies"
         self.log_path = "logs/ai_worker.log"
+
+        # 5. Candidate Profile (Dynamic JSON)
+        self.profile_data = self._load_profile()
+
+    def _load_profile(self) -> dict:
+        paths = [
+            PROJECT_ROOT / "candidate_profile.json",
+            Path("/app/candidate_profile.json"),
+            Path("candidate_profile.json"),
+            CURRENT_DIR.parent / "candidate_profile.json",
+        ]
+        for p in paths:
+            if p.exists():
+                try:
+                    with open(p, "r", encoding="utf-8") as f:
+                        return json.load(f)
+                except Exception:
+                    pass
+        return {}
 
     def rabbitmq_url(self) -> str:
         return f"amqp://{self.rmq_user}:{self.rmq_pass}@{self.rmq_host}:{self.rmq_port}/"

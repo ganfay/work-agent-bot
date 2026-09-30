@@ -31,7 +31,26 @@ func (c *Config) RabbitMQURL() string {
 
 func LoadConfig(envPath string) *Config {
 	var cfg Config
-	err := cleanenv.ReadConfig(envPath, &cfg)
+	var err error
+
+	// 1. Try provided path if exists
+	if envPath != "" {
+		if _, statErr := os.Stat(envPath); statErr == nil {
+			if err = cleanenv.ReadConfig(envPath, &cfg); err == nil {
+				return &cfg
+			}
+		}
+	}
+
+	// 2. Try current directory .env if exists
+	if _, statErr := os.Stat(".env"); statErr == nil {
+		if err = cleanenv.ReadConfig(".env", &cfg); err == nil {
+			return &cfg
+		}
+	}
+
+	// 3. Fallback to process environment variables (standard in Docker / Prod)
+	err = cleanenv.ReadEnv(&cfg)
 	if err != nil {
 		slog.Error("failed to load bot configuration", "error", err)
 		os.Exit(1)
