@@ -65,13 +65,13 @@ flowchart TD
     Q1 -->|Consume| Consumer
     Consumer --> A1
     A1 -->|Extracted stack| A2
-    A2 <-->|Cosine Search 1 - <=>| VectorStore
+    A2 <-->|"Vector Search (Cosine Similarity)"| VectorStore
     A2 -->|Verified Evidence Dossier| A3
     A3 -->|Initial Draft| A4
     A4 -->|Final Polished Proposal| Q2
 
     Q2 -->|Consume proposal| Telebot
-    Telebot -->|Interactive Card\n[Approve] [Reject]| User
+    Telebot -->|"Interactive Card (Approve / Reject)"| User
     User -->|Reject Reason Click| Telebot
     Telebot -->|Publish Feedback Event| Q3
     Q3 -->|Feedback Consumer| FeedbackEngine
