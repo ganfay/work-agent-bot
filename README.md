@@ -125,8 +125,8 @@ Rather than giving an autonomous agent unconstrained tool execution permissions 
 ### 2. Configure Environment
 Clone the repository and copy the environment template:
 ```bash
-git clone https://github.com/ganfay/freelance-agent.git
-cd freelance-agent
+git clone https://github.com/ganfay/work-agent-bot.git
+cd work-agent-bot
 cp .env.example .env
 ```
 
