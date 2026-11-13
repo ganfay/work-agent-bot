@@ -21,13 +21,17 @@ services:
   rabbitmq:
     image: rabbitmq:4.3.6-management-alpine
     container_name: bidder_rabbitmq
+    hostname: rabbitmq
     restart: unless-stopped
     environment:
       RABBITMQ_DEFAULT_USER: ${RMQ_USER}
       RABBITMQ_DEFAULT_PASS: ${RMQ_PASS}
+      RABBITMQ_NODENAME: rabbit@rabbitmq
     ports:
       - "5672:5672"
       - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 5s
@@ -39,12 +43,13 @@ services:
       context: ./scraper
       dockerfile: Dockerfile
     container_name: bidder_scraper
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     env_file:
       - .env
     environment:
       PG_HOST: db
       RMQ_HOST: rabbitmq
+      RUN_ONCE: ${RUN_ONCE:-false}
     depends_on:
       db:
         condition: service_healthy
@@ -56,12 +61,13 @@ services:
       context: ./ai_worker
       dockerfile: Dockerfile
     container_name: bidder_ai_worker
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     env_file:
       - .env
     environment:
       PG_HOST: db
       RMQ_HOST: rabbitmq
+      RUN_ONCE: ${RUN_ONCE:-false}
     volumes:
       - ./candidate_profile.json:/app/candidate_profile.json:ro
     depends_on:
@@ -75,14 +81,16 @@ services:
       context: ./tg_bot
       dockerfile: Dockerfile
     container_name: bidder_tg_bot
-    restart: unless-stopped
+    restart: ${RESTART_POLICY:-unless-stopped}
     env_file:
       - .env
     environment:
       RMQ_HOST: rabbitmq
+      RUN_ONCE: ${RUN_ONCE:-false}
     depends_on:
       rabbitmq:
         condition: service_healthy
 
 volumes:
   db_data:
+  rabbitmq_data:

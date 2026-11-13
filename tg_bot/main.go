@@ -7,6 +7,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"tg_bot/internal/bot"
 	"tg_bot/internal/broker"
@@ -46,43 +49,107 @@ func main() {
 		os.Exit(1)
 	}
 
-	go func() {
-		slog.Info("listening for AI proposals on 'review_queue'...")
-		for {
-			select {
-			case <-ctx.Done():
-				slog.Info("stopping message consumer loop...")
-				return
+	slog.Info("telegram bot service started", "run_once", cfg.Bot.RunOnce)
+	runConsumerLoop(
+		ctx,
+		msgs,
+		telegramBot,
+		cfg.Telegram.UserID,
+		cfg.Bot.RunOnce,
+		cfg.Bot.BatchIdleTimeout,
+		cfg.Bot.PollGrace,
+	)
+	slog.Info("shutdown complete: closing connections...")
+}
 
-			case msg, ok := <-msgs:
-				if !ok {
-					return
-				}
+type ProposalSender interface {
+	SendVacancy(userID int64, p broker.Proposal) error
+}
 
-				var proposal broker.Proposal
-				if err := json.Unmarshal(msg.Body, &proposal); err != nil {
-					slog.Error("invalid JSON from python worker", "error", err)
-					_ = msg.Nack(false, false)
-					continue
-				}
+func runConsumerLoop(
+	ctx context.Context,
+	msgs <-chan amqp.Delivery,
+	sender ProposalSender,
+	userID int64,
+	runOnce bool,
+	idleTimeout time.Duration,
+	pollGrace time.Duration,
+) {
+	slog.Info("listening for AI proposals on 'review_queue'...")
 
-				slog.Info("received vacancy for review", "title", proposal.Title, "score", proposal.MatchScore)
+	var idleTimer *time.Timer
+	var idleCh <-chan time.Time
+	if runOnce {
+		idleTimer = time.NewTimer(idleTimeout)
+		defer idleTimer.Stop()
+		idleCh = idleTimer.C
+	}
 
-				err := telegramBot.SendVacancy(cfg.Telegram.UserID, proposal)
-				if err != nil {
-					slog.Error("failed to send telegram message to user", "error", err)
-					_ = msg.Nack(false, true)
-					continue
-				}
+consumeLoop:
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("stopping message consumer loop...")
+			return
 
-				_ = msg.Ack(false)
-				slog.Info("proposal delivered to telegram successfully", "title", proposal.Title)
+		case <-idleCh:
+			slog.Info("batch idle timeout reached on review_queue", "timeout", idleTimeout.String())
+			break consumeLoop
+
+		case msg, ok := <-msgs:
+			if !ok {
+				slog.Info("review_queue channel closed")
+				break consumeLoop
 			}
+
+			if runOnce && idleTimer != nil {
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+				idleTimer.Reset(idleTimeout)
+			}
+
+			var proposal broker.Proposal
+			if err := json.Unmarshal(msg.Body, &proposal); err != nil {
+				slog.Error("invalid JSON from python worker", "error", err)
+				_ = msg.Nack(false, false)
+				continue
+			}
+
+			if proposal.BatchEOF {
+				_ = msg.Ack(false)
+				slog.Info("received batch EOF marker on review_queue")
+				if runOnce {
+					break consumeLoop
+				}
+				continue
+			}
+
+			slog.Info("received vacancy for review", "title", proposal.Title, "score", proposal.MatchScore)
+
+			err := sender.SendVacancy(userID, proposal)
+			if err != nil {
+				slog.Error("failed to send telegram message to user", "error", err)
+				requeue := !runOnce && !msg.Redelivered
+				_ = msg.Nack(false, requeue)
+				continue
+			}
+
+			_ = msg.Ack(false)
+			slog.Info("proposal delivered to telegram successfully", "title", proposal.Title)
 		}
-	}()
+	}
 
-	slog.Info("telegram bot service is running. Press CTRL+C to exit.")
-
-	<-ctx.Done()
-	slog.Info("shutdown signal received: closing connections...")
+	if runOnce && pollGrace > 0 && ctx.Err() == nil {
+		slog.Info("waiting Telegram poll grace window for pending Approve/Reject callbacks...", "grace", pollGrace.String())
+		graceTimer := time.NewTimer(pollGrace)
+		defer graceTimer.Stop()
+		select {
+		case <-ctx.Done():
+		case <-graceTimer.C:
+		}
+	}
 }

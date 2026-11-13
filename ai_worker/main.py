@@ -1,8 +1,13 @@
+import signal
 import sys
 import psycopg2
 
 from broker.consumer import RabbitMQConsumer
-from broker.feedback_consumer import start_feedback_listener_thread, get_recent_feedback_reasons
+from broker.feedback_consumer import (
+    start_feedback_listener_thread,
+    drain_feedback_queue,
+    get_recent_feedback_reasons,
+)
 from config.config import settings
 from core.logger import setup_logger
 from agents.analyzer import VacancyAnalyzer
@@ -52,20 +57,22 @@ def ensure_embeddings_exist():
     except Exception as e:
         logger.error(f"[RAG] Error checking vector database: {e}")
 
-ensure_embeddings_exist()
+analyzer = None
+validator = None
+drafter = None
+critic = None
 
-# 3. Start background feedback listener (RabbitMQ -> PostgreSQL user_feedback)
-start_feedback_listener_thread()
 
-# 4. Initialize our 4 agents
-if not settings.gemini_api_key:
-    logger.critical("GEMINI_API_KEY is not set in .env! Exiting.")
-    sys.exit(1)
+def init_agents():
+    global analyzer, validator, drafter, critic
+    if not settings.gemini_api_key:
+        logger.critical("GEMINI_API_KEY is not set in .env! Exiting.")
+        sys.exit(1)
 
-analyzer = VacancyAnalyzer(api_key=settings.gemini_api_key)
-validator = EvidenceValidator(api_key=settings.gemini_api_key)
-drafter = CoverLetterDrafter(api_key=settings.gemini_api_key)
-critic = CoverLetterCritic(api_key=settings.gemini_api_key)
+    analyzer = VacancyAnalyzer(api_key=settings.gemini_api_key)
+    validator = EvidenceValidator(api_key=settings.gemini_api_key)
+    drafter = CoverLetterDrafter(api_key=settings.gemini_api_key)
+    critic = CoverLetterCritic(api_key=settings.gemini_api_key)
 
 
 # 5. Vacancy processing handler
@@ -137,19 +144,43 @@ def process_vacancy(job: dict, publisher_func):
 
 
 def main():
-    logger.info("Starting AI Worker Service with full 4-Agent Pipeline, pgvector & Feedback Engine...")
+    logger.info(
+        f"Starting AI Worker Service (run_once={settings.run_once}, "
+        f"batch_idle_timeout={settings.batch_idle_timeout}s)..."
+    )
+
+    ensure_embeddings_exist()
+    init_agents()
 
     consumer = RabbitMQConsumer(
         amqp_url=settings.rabbitmq_url(),
         queue_name=settings.queue_name
     )
 
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt()
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
     try:
+        if settings.run_once:
+            drain_feedback_queue()
+            consumer.connect()
+            consumer.consume_batch(
+                message_handler=process_vacancy,
+                idle_timeout=settings.batch_idle_timeout,
+            )
+            drain_feedback_queue()
+            consumer.close()
+            logger.info("RUN_ONCE=true: AI Worker batch run completed, exiting cleanly.")
+            return
+
+        start_feedback_listener_thread()
         consumer.connect()
         consumer.start_consuming(message_handler=process_vacancy)
 
     except KeyboardInterrupt:
-        logger.info("Shutdown signal received (Ctrl+C). Closing worker...")
+        logger.info("Shutdown signal received. Closing worker...")
         consumer.close()
         sys.exit(0)
 

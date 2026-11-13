@@ -35,6 +35,11 @@ class Config:
         # 4. Worker Settings
         self.queue_name = "new_vacancies"
         self.log_path = "logs/ai_worker.log"
+        self.run_once = os.getenv("RUN_ONCE", "false").strip().lower() in ("true", "1", "yes")
+        raw_idle = (os.getenv("AI_BATCH_IDLE_TIMEOUT") or os.getenv("BATCH_IDLE_TIMEOUT") or "20").strip()
+        if raw_idle.endswith("s"):
+            raw_idle = raw_idle[:-1].strip()
+        self.batch_idle_timeout = float(raw_idle)
 
         # 5. Candidate Profile (Dynamic JSON)
         self.profile_data = self._load_profile()

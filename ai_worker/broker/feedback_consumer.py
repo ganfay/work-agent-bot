@@ -87,3 +87,51 @@ def start_feedback_listener_thread():
     thread = threading.Thread(target=run, daemon=True)
     thread.start()
     return thread
+
+
+def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None) -> int:
+    """Synchronously drains all pending messages from feedback_queue into PostgreSQL."""
+    rmq_url = amqp_url or settings.rabbitmq_url()
+    pg_url = db_url or settings.database_url()
+    processed = 0
+    connection = None
+    try:
+        params = pika.URLParameters(rmq_url)
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        channel.queue_declare(queue="feedback_queue", durable=True)
+
+        while True:
+            method_frame, _, body = channel.basic_get(queue="feedback_queue", auto_ack=False)
+            if method_frame is None:
+                break
+            try:
+                data = json.loads(body.decode("utf-8"))
+                job_title = data.get("job_title", "Unknown")
+                reason = data.get("reason", "No reason")
+
+                conn = psycopg2.connect(pg_url)
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    INSERT INTO user_feedback (job_title, reason, status)
+                    VALUES (%s, %s, 'rejected');
+                    """,
+                    (job_title, reason),
+                )
+                conn.commit()
+                cur.close()
+                conn.close()
+
+                channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                processed += 1
+                logger.info(f"[FeedbackEngine] Drained feedback for '{job_title}': '{reason}'")
+            except Exception as e:
+                logger.error(f"[FeedbackEngine] Error draining feedback message: {e}")
+                channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
+    except Exception as e:
+        logger.error(f"[FeedbackEngine] Failed to drain feedback_queue: {e}")
+    finally:
+        if connection is not None and not connection.is_closed:
+            connection.close()
+    return processed

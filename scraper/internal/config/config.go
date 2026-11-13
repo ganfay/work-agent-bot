@@ -27,6 +27,7 @@ type Config struct {
 		RSSURL   string        `env:"DJINNI_RSS_URL" env-required:"true"`
 		LogPath  string        `env:"LOG_PATH" env-default:"logs/scraper.log"`
 		Interval time.Duration `env:"SCRAPE_INTERVAL" env-default:"15m"`
+		RunOnce  bool          `env:"RUN_ONCE" env-default:"false"`
 	}
 }
 

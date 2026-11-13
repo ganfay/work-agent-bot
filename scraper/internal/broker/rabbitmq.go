@@ -59,8 +59,23 @@ func (r *RabbitMQ) PublishJob(ctx context.Context, queueName string, job djinni.
 		false,     // mandatory
 		false,     // immediate
 		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "application/json",
+			Body:         body,
+		},
+	)
+}
+
+func (r *RabbitMQ) PublishBatchEOF(ctx context.Context, queueName string) error {
+	return r.ch.PublishWithContext(ctx,
+		"",        // exchange
+		queueName, // routing key
+		false,     // mandatory
+		false,     // immediate
+		amqp.Publishing{
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "application/json",
+			Body:         []byte(`{"_batch_eof":true}`),
 		},
 	)
 }

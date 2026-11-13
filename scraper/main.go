@@ -56,11 +56,46 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 6. Run the first scrape iteration immediately on startup
-	slog.Info("executing initial scrape cycle")
-	runScrapeIteration(ctx, cfg, repo, mq, queueName)
+	// 6. Run scraper in batch (RUN_ONCE=true) or daemon mode
+	run(ctx, cfg, repo, mq, queueName, djinni.FetchJobs)
+}
 
-	// 7. Background ticker loop for periodic scraping
+type JobRepository interface {
+	SaveJobIfNotExists(ctx context.Context, job djinni.Job) (bool, error)
+}
+
+type JobPublisher interface {
+	PublishJob(ctx context.Context, queueName string, job djinni.Job) error
+	PublishBatchEOF(ctx context.Context, queueName string) error
+}
+
+type JobFetcher func(rssURL string) ([]djinni.Job, error)
+
+func run(
+	ctx context.Context,
+	cfg *config.Config,
+	repo JobRepository,
+	mq JobPublisher,
+	queueName string,
+	fetchJobs JobFetcher,
+) {
+	slog.Info("executing initial scrape cycle", "run_once", cfg.Scraper.RunOnce)
+	runScrapeIteration(ctx, cfg, repo, mq, queueName, fetchJobs)
+
+	if cfg.Scraper.RunOnce {
+		if ctx.Err() == nil {
+			pubCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			if err := mq.PublishBatchEOF(pubCtx, queueName); err != nil {
+				slog.Error("failed to publish batch EOF marker", "queue", queueName, "error", err)
+			} else {
+				slog.Info("published batch EOF marker", "queue", queueName)
+			}
+			cancel()
+		}
+		slog.Info("RUN_ONCE=true: scraper batch run completed, exiting cleanly")
+		return
+	}
+
 	ticker := time.NewTicker(cfg.Scraper.Interval)
 	defer ticker.Stop()
 
@@ -70,13 +105,12 @@ func main() {
 		select {
 		case <-ctx.Done():
 			slog.Info("termination signal received: starting graceful shutdown...")
-			// When returningч, all defers (ticker.Stop, mq.Close, repo.Close) execute cleanly
 			slog.Info("scraper daemon stopped successfully.")
 			return
 
 		case <-ticker.C:
 			slog.Info("ticker triggered periodic scrape cycle")
-			runScrapeIteration(ctx, cfg, repo, mq, queueName)
+			runScrapeIteration(ctx, cfg, repo, mq, queueName, fetchJobs)
 		}
 	}
 }
@@ -85,16 +119,17 @@ func main() {
 func runScrapeIteration(
 	ctx context.Context,
 	cfg *config.Config,
-	repo *repository.JobRepository,
-	mq *broker.RabbitMQ,
+	repo JobRepository,
+	mq JobPublisher,
 	queueName string,
+	fetchJobs JobFetcher,
 ) {
 	// Check if the service was already requested to shut down
 	if ctx.Err() != nil {
 		return
 	}
 
-	jobs, err := djinni.FetchJobs(cfg.Scraper.RSSURL)
+	jobs, err := fetchJobs(cfg.Scraper.RSSURL)
 	if err != nil {
 		slog.Error("failed to fetch jobs from djinni", "error", err)
 		return

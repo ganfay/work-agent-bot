@@ -10,6 +10,7 @@ help:
 	@echo "           FREELANCE AGENT - MASTER CONTROL CENTER                    "
 	@echo "======================================================================"
 	@echo "  make up             - Build and start all 5 services in background"
+	@echo "  make run-once       - Run full stack in RUN_ONCE=true batch mode, then tear down (0 idle RAM)"
 	@echo "  make down           - Stop all running containers"
 	@echo "  make restart        - Restart all containers"
 	@echo "  make ps             - View status of all system containers"
@@ -26,6 +27,13 @@ help:
 .PHONY: up
 up:
 	$(DOCKER_COMPOSE) up -d --build
+
+.PHONY: run-once
+run-once:
+	$(DOCKER_COMPOSE) up -d db rabbitmq
+	@status=0; RUN_ONCE=true RESTART_POLICY=no $(DOCKER_COMPOSE) up --build scraper ai_worker tg_bot || status=$$?; \
+	$(DOCKER_COMPOSE) down; \
+	exit $$status
 
 .PHONY: down
 down:

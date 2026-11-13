@@ -8,7 +8,7 @@
 [![RabbitMQ](https://img.shields.io/badge/RabbitMQ-4.x-FF6600?style=flat&logo=rabbitmq)](https://www.rabbitmq.com/)
 [![Docker Compose](https://img.shields.io/badge/Docker%20Compose-Ready-2496ED?style=flat&logo=docker)](https://www.docker.com/)
 [![LLM Engine](https://img.shields.io/badge/Google%20Gemini-3.5%20Flash%20Lite-8E75B2?style=flat&logo=google)](https://ai.google.dev/)
-
+    
 ---
 
 ## 🏛️ System Architecture

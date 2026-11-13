@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
 )
@@ -20,7 +21,10 @@ type Config struct {
 		Port     string `env:"RMQ_PORT" env-default:"5672"`
 	}
 	Bot struct {
-		LogPath string `env:"TG_LOG_PATH" env-default:"logs/tg_bot.log"`
+		LogPath          string        `env:"TG_LOG_PATH" env-default:"logs/tg_bot.log"`
+		RunOnce          bool          `env:"RUN_ONCE" env-default:"false"`
+		BatchIdleTimeout time.Duration `env:"TG_BATCH_IDLE_TIMEOUT" env-default:"90s"`
+		PollGrace        time.Duration `env:"TG_POLL_GRACE" env-default:"15s"`
 	}
 }
 

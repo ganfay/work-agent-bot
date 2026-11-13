@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 import pika
 
 logger = logging.getLogger("ai_worker")
@@ -14,6 +15,8 @@ class RabbitMQConsumer:
 
     def connect(self):
         params = pika.URLParameters(self.amqp_url)
+        params.heartbeat = 600
+        params.blocked_connection_timeout = 300
         self.connection = pika.BlockingConnection(params)
         self.channel = self.connection.channel()
 
@@ -64,6 +67,65 @@ class RabbitMQConsumer:
 
         logger.info("Waiting for messages from RabbitMQ. To exit press CTRL+C")
         self.channel.start_consuming()
+
+    def publish_batch_eof(self, queue_name: str = "review_queue"):
+        """Publishes a batch EOF marker so downstream consumers know the batch is complete."""
+        self.publish_review({"_batch_eof": True}, queue_name=queue_name)
+        logger.info(f"[+] Batch EOF marker published to RabbitMQ queue: '{queue_name}'")
+
+    def consume_batch(self, message_handler, idle_timeout: float = 20.0, stop_event=None):
+        """Drains queue until _batch_eof marker or idle_timeout seconds without messages."""
+        last_activity = time.monotonic()
+        logger.info(
+            f"Batch mode: draining '{self.queue_name}' (idle_timeout={idle_timeout}s)..."
+        )
+        try:
+            for method_frame, properties, body in self.channel.consume(
+                queue=self.queue_name,
+                inactivity_timeout=1.0,
+            ):
+                if stop_event is not None and stop_event.is_set():
+                    logger.info("Batch consumer stop requested.")
+                    break
+
+                if method_frame is None:
+                    if time.monotonic() - last_activity >= idle_timeout:
+                        logger.info(
+                            f"Idle timeout ({idle_timeout}s) reached on '{self.queue_name}'. Draining complete."
+                        )
+                        break
+                    continue
+
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                except Exception as err:
+                    logger.error(f"Failed to decode message JSON: {err}", exc_info=True)
+                    self.channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
+                    last_activity = time.monotonic()
+                    continue
+
+                if payload.get("_batch_eof") is True:
+                    self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                    logger.info(f"Received batch EOF marker on '{self.queue_name}'.")
+                    break
+
+                try:
+                    title = payload.get("Title", "No Title")
+                    logger.info(f"Received vacancy: '{title}'")
+                    message_handler(payload, self.publish_review)
+                    self.channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                    logger.info("Message processed and ACK sent.")
+                except Exception as err:
+                    logger.error(f"Failed to process message: {err}", exc_info=True)
+                    self.channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
+
+                last_activity = time.monotonic()
+        finally:
+            try:
+                self.channel.cancel()
+            except Exception:
+                pass
+        self.publish_batch_eof(queue_name="review_queue")
 
     def close(self):
         if self.connection and not self.connection.is_closed:

@@ -11,6 +11,7 @@ import (
 )
 
 type Proposal struct {
+	BatchEOF        bool     `json:"_batch_eof,omitempty"`
 	Title           string   `json:"title"`
 	Link            string   `json:"link"`
 	MatchScore      int      `json:"match_score"`
@@ -103,8 +104,9 @@ func (r *RabbitMQ) SendFeedback(jobTitle, reason string) error {
 		false,
 		false,
 		amqp.Publishing{
-			ContentType: "application/json",
-			Body:        body,
+			DeliveryMode: amqp.Persistent,
+			ContentType:  "application/json",
+			Body:         body,
 		},
 	)
 }
