@@ -121,6 +121,9 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                 channel.queue_declare(queue=FEEDBACK_DLQ_NAME, durable=True)
                 channel.basic_qos(prefetch_count=1)
 
+                if stop_event is not None and stop_event.is_set():
+                    break
+
                 backoff = 1.0
                 logger.info("[FeedbackEngine] Background listener running for 'feedback_queue'...")
 

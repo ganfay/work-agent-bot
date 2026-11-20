@@ -110,6 +110,61 @@ class TestRabbitMQConsumerHardening(unittest.TestCase):
         self.assertIsNone(consumer.channel)
         self.assertIsNone(consumer.connection)
 
+    def test_start_consuming_exits_when_stop_event_fires_during_connect(self):
+        stop_ev = threading.Event()
+        consumer = RabbitMQConsumer("amqp://guest:guest@localhost:5672/", "new_vacancies")
+
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_channel.is_closed = False
+        mock_channel._queue_consumer_generator = None
+
+        mock_conn = MagicMock()
+        mock_conn.is_open = True
+        mock_conn.is_closed = False
+        mock_conn.channel.return_value = mock_channel
+
+        def connect_while_stopping(*args, **kwargs):
+            # Signal handler fires while self.connection is still None inside connect()
+            stop_ev.set()
+            consumer.request_stop()
+            return mock_conn
+
+        with patch("broker.consumer.pika.BlockingConnection", side_effect=connect_while_stopping):
+            consumer.start_consuming(MagicMock(), stop_event=stop_ev)
+
+        mock_channel.basic_consume.assert_not_called()
+        mock_channel.start_consuming.assert_not_called()
+
+    def test_start_consuming_exits_when_stop_event_fires_between_basic_consume_and_start_consuming(self):
+        stop_ev = threading.Event()
+        consumer = RabbitMQConsumer("amqp://guest:guest@localhost:5672/", "new_vacancies")
+
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_channel.is_closed = False
+        mock_channel._queue_consumer_generator = None
+
+        mock_conn = MagicMock()
+        mock_conn.is_open = True
+        mock_conn.is_closed = False
+        consumer.connection = mock_conn
+        consumer.channel = mock_channel
+
+        def stop_during_basic_consume(*args, **kwargs):
+            stop_ev.set()
+            consumer.request_stop()
+            return "ctag-1"
+
+        mock_channel.basic_consume.side_effect = stop_during_basic_consume
+
+        consumer.start_consuming(MagicMock(), stop_event=stop_ev)
+
+        mock_channel.basic_consume.assert_called_once()
+        mock_conn.add_callback_threadsafe.assert_called_once()
+        mock_channel.stop_consuming.assert_called_once_with("ctag-1")
+        mock_channel.start_consuming.assert_not_called()
+
 
 class TestFeedbackConsumerHardening(unittest.TestCase):
     def test_status_normalization(self):
@@ -164,6 +219,28 @@ class TestFeedbackConsumerHardening(unittest.TestCase):
         self.assertEqual(len(dlq_publishes), 2)
         mock_channel.basic_ack.assert_any_call(delivery_tag=1)
         mock_channel.basic_ack.assert_any_call(delivery_tag=3)
+
+    def test_feedback_listener_skips_basic_consume_when_stop_event_fires_during_connect(self):
+        stop_ev = threading.Event()
+        mock_channel = MagicMock()
+        mock_channel.is_open = True
+        mock_channel.is_closed = False
+        mock_conn = MagicMock()
+        mock_conn.is_open = True
+        mock_conn.is_closed = False
+        mock_conn.channel.return_value = mock_channel
+
+        def connect_and_stop(*args, **kwargs):
+            stop_ev.set()
+            return mock_conn
+
+        with patch("broker.feedback_consumer.pika.BlockingConnection", side_effect=connect_and_stop):
+            t = feedback_consumer.start_feedback_listener_thread(stop_event=stop_ev)
+            t.join(timeout=3.0)
+
+        self.assertFalse(t.is_alive())
+        mock_channel.basic_consume.assert_not_called()
+        mock_conn.close.assert_called_once()
 
     def test_drain_feedback_queue_resets_pg_conn_on_operational_error(self):
         m1 = SimpleNamespace(delivery_tag=1)

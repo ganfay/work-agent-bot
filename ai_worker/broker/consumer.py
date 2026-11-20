@@ -248,10 +248,26 @@ class RabbitMQConsumer:
                 ):
                     self.connect()
 
-                self.channel.basic_consume(
+                if stop_event is not None and stop_event.is_set():
+                    break
+
+                consumer_tag = self.channel.basic_consume(
                     queue=self.queue_name,
                     on_message_callback=callback,
                 )
+
+                if stop_event is not None and stop_event.is_set():
+                    if is_channel_open(self.channel):
+                        try:
+                            if isinstance(consumer_tag, str) and consumer_tag:
+                                self.channel.stop_consuming(consumer_tag)
+                            else:
+                                self.channel.stop_consuming()
+                        except Exception as err:
+                            logger.debug(
+                                f"Ignored error cancelling consumer during shutdown: {redact_url(err)}"
+                            )
+                    break
 
                 backoff = 1.0
                 logger.info("Waiting for messages from RabbitMQ. To exit press CTRL+C")
