@@ -1,9 +1,15 @@
 package broker
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -92,6 +98,7 @@ type fakeChannel struct {
 	nextDC       func() deferredConfirmation
 	pendingDCs   []*fakeDeferredConfirm
 	closeCalls   int
+	onClose      func()
 }
 
 func (c *fakeChannel) Confirm(noWait bool) error {
@@ -160,10 +167,14 @@ func (c *fakeChannel) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.closeCalls++
+	onClose := c.onClose
 	pending := append([]*fakeDeferredConfirm(nil), c.pendingDCs...)
 	c.pendingDCs = nil
 	c.mu.Unlock()
 
+	if onClose != nil {
+		onClose()
+	}
 	for _, dc := range pending {
 		dc.resolve(false, nil)
 	}
@@ -183,6 +194,7 @@ type fakeConn struct {
 	channelErr error
 	nextChFn   func() *fakeChannel
 	closeCalls int
+	onClose    func()
 }
 
 func (c *fakeConn) Channel() (amqpChannel, error) {
@@ -214,9 +226,13 @@ func (c *fakeConn) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	c.closeCalls++
+	onClose := c.onClose
 	chs := append([]*fakeChannel(nil), c.channels...)
 	c.mu.Unlock()
 
+	if onClose != nil {
+		onClose()
+	}
 	for _, ch := range chs {
 		_ = ch.Close()
 	}
@@ -713,5 +729,396 @@ func TestRabbitMQ_ConcurrencyAndCloseUnblocksWait(t *testing.T) {
 			r.Close()
 		}()
 		wg.Wait()
+	})
+}
+
+func TestNewRabbitMQ_RedactsCredentialsOnError(t *testing.T) {
+	t.Run("NewRabbitMQ malformed port redacts user and pass", func(t *testing.T) {
+		_, err := NewRabbitMQ("amqp://rmq_user:SUPER_SECRET_PASS@localhost:badport/")
+		if err == nil {
+			t.Fatal("expected error for malformed port, got nil")
+		}
+		if strings.Contains(err.Error(), "SUPER_SECRET_PASS") || strings.Contains(err.Error(), "rmq_user") {
+			t.Fatalf("expected credentials redacted from error, got %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), "xxxxx:xxxxx@localhost:badport") || !strings.Contains(err.Error(), "invalid port") {
+			t.Fatalf("expected redacted host and invalid port message, got %q", err.Error())
+		}
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			if strings.Contains(urlErr.URL, "SUPER_SECRET_PASS") || strings.Contains(urlErr.URL, "rmq_user") {
+				t.Fatalf("expected urlErr.URL redacted, got %q", urlErr.URL)
+			}
+		}
+	})
+
+	t.Run("NewRabbitMQ encoded credentials and bad IPv6 host", func(t *testing.T) {
+		_, err := NewRabbitMQ("amqp://rmq%3Auser:MySecret%2199@bad[host:5672/")
+		if err == nil {
+			t.Fatal("expected error for malformed IPv6 host, got nil")
+		}
+		if strings.Contains(err.Error(), "MySecret%2199") || strings.Contains(err.Error(), "rmq%3Auser") {
+			t.Fatalf("expected encoded credentials redacted from error, got %q", err.Error())
+		}
+	})
+
+	t.Run("NewRabbitMQ unescaped at-sign in password", func(t *testing.T) {
+		_, err := NewRabbitMQ("amqp://rmq_user:p@ss@localhost:badport/")
+		if err == nil {
+			t.Fatal("expected error for malformed port, got nil")
+		}
+		if strings.Contains(err.Error(), "p@ss") || strings.Contains(err.Error(), "rmq_user") {
+			t.Fatalf("expected credentials redacted from error, got %q", err.Error())
+		}
+	})
+
+	t.Run("wrapped url.Error from dialer is scrubbed while preserving inner cause", func(t *testing.T) {
+		sentinelErr := errors.New("bad port syntax")
+		rawURL := "amqp://rmq_user:SUPER_SECRET_PASS@localhost:badport/"
+		_, err := newRabbitMQWithDialer(rawURL, func(_ context.Context, u string) (amqpConn, error) {
+			return nil, fmt.Errorf("dial failed: %w", &url.Error{Op: "parse", URL: u, Err: sentinelErr})
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if strings.Contains(err.Error(), "SUPER_SECRET_PASS") || strings.Contains(err.Error(), "rmq_user") {
+			t.Fatalf("expected wrapped url.Error credentials redacted, got %q", err.Error())
+		}
+		if !errors.Is(err, sentinelErr) {
+			t.Fatalf("expected errors.Is(err, sentinelErr) to be true, got %v", err)
+		}
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			t.Fatalf("expected unredacted *url.Error removed from unwrap chain, got %+v", ue)
+		}
+	})
+
+	t.Run("plain error containing raw AMQP URL is redacted", func(t *testing.T) {
+		rawURL := "amqp://rmq_user:SUPER_SECRET_PASS@localhost:5672/"
+		_, err := newRabbitMQWithDialer(rawURL, func(_ context.Context, u string) (amqpConn, error) {
+			return nil, errors.New("connect " + u + " failed")
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if strings.Contains(err.Error(), "SUPER_SECRET_PASS") || strings.Contains(err.Error(), "rmq_user") {
+			t.Fatalf("expected plain error AMQP URL redacted, got %q", err.Error())
+		}
+		if !strings.Contains(err.Error(), "xxxxx:xxxxx@localhost:5672") {
+			t.Fatalf("expected redacted host in plain error, got %q", err.Error())
+		}
+	})
+
+	t.Run("short credentials do not corrupt unrelated error text", func(t *testing.T) {
+		_, err := newRabbitMQWithDialer("amqp://u:p@localhost:5672/", func(_ context.Context, _ string) (amqpConn, error) {
+			return nil, errors.New("broken pipe")
+		})
+		if err == nil {
+			t.Fatal("expected error, got nil")
+		}
+		if !strings.Contains(err.Error(), "broken pipe") {
+			t.Fatalf("expected unrelated error text intact, got %q", err.Error())
+		}
+	})
+}
+
+func TestRabbitMQ_ResetClosesConnBeforeChannel(t *testing.T) {
+	assertConnClosedFirst := func(t *testing.T, trigger func(t *testing.T, r *RabbitMQ, conn *fakeConn, ch *fakeChannel), setupCh func() *fakeChannel, expectInitErr bool) {
+		t.Helper()
+		var mu sync.Mutex
+		var events []string
+		var chSawOpenConn bool
+
+		ch := setupCh()
+		conn := &fakeConn{
+			nextChFn: func() *fakeChannel { return ch },
+		}
+		conn.onClose = func() {
+			mu.Lock()
+			events = append(events, "conn.Close")
+			mu.Unlock()
+		}
+		ch.onClose = func() {
+			mu.Lock()
+			events = append(events, "ch.Close")
+			if !conn.IsClosed() {
+				chSawOpenConn = true
+			}
+			mu.Unlock()
+		}
+
+		r, err := newRabbitMQWithDialer("amqp://localhost", func(_ context.Context, _ string) (amqpConn, error) {
+			return conn, nil
+		})
+		if expectInitErr {
+			if err == nil {
+				t.Fatal("expected initialization error, got nil")
+			}
+		} else if err != nil {
+			t.Fatalf("setup failed: %v", err)
+		} else {
+			trigger(t, r, conn, ch)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if len(events) < 2 {
+			t.Fatalf("expected both conn.Close and ch.Close events, got %v", events)
+		}
+		if events[0] != "conn.Close" {
+			t.Fatalf("expected conn.Close before ch.Close, got order %v", events)
+		}
+		if chSawOpenConn {
+			t.Fatalf("ch.Close observed open conn (events=%v)", events)
+		}
+	}
+
+	t.Run("Close closes conn before channel", func(t *testing.T) {
+		assertConnClosedFirst(
+			t,
+			func(_ *testing.T, r *RabbitMQ, _ *fakeConn, _ *fakeChannel) {
+				r.Close()
+			},
+			func() *fakeChannel { return &fakeChannel{} },
+			false,
+		)
+	})
+
+	t.Run("PublishJob timeout reset closes conn before channel", func(t *testing.T) {
+		assertConnClosedFirst(
+			t,
+			func(t *testing.T, r *RabbitMQ, _ *fakeConn, _ *fakeChannel) {
+				defer r.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+				defer cancel()
+				err := r.PublishJob(ctx, "new_vacancies", djinni.Job{GUID: "g-order"})
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+				}
+			},
+			func() *fakeChannel {
+				return &fakeChannel{
+					nextDC: func() deferredConfirmation { return newBlockingFakeDeferredConfirm() },
+				}
+			},
+			false,
+		)
+	})
+
+	t.Run("openConfirmedChannelLocked confirm error closes conn before channel", func(t *testing.T) {
+		assertConnClosedFirst(
+			t,
+			nil,
+			func() *fakeChannel { return &fakeChannel{confirmErr: errors.New("confirm failed")} },
+			true,
+		)
+	})
+}
+
+func writeAMQPMethodFrame(w io.Writer, channel uint16, classID, methodID uint16, args []byte) error {
+	size := uint32(4 + len(args))
+	var hdr [7]byte
+	hdr[0] = 1 // frameMethod
+	binary.BigEndian.PutUint16(hdr[1:3], channel)
+	binary.BigEndian.PutUint32(hdr[3:7], size)
+
+	var body bytes.Buffer
+	body.Grow(7 + int(size) + 1)
+	body.Write(hdr[:])
+	_ = binary.Write(&body, binary.BigEndian, classID)
+	_ = binary.Write(&body, binary.BigEndian, methodID)
+	body.Write(args)
+	body.WriteByte(0xCE) // frameEnd
+
+	_, err := w.Write(body.Bytes())
+	return err
+}
+
+func readAMQPFrame(r io.Reader) error {
+	var hdr [7]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return err
+	}
+	size := binary.BigEndian.Uint32(hdr[3:7])
+	buf := make([]byte, int(size)+1) // payload + frameEnd (0xCE)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return err
+	}
+	if buf[len(buf)-1] != 0xCE {
+		return fmt.Errorf("invalid AMQP frame end byte: 0x%02x", buf[len(buf)-1])
+	}
+	return nil
+}
+
+// startBlackholeAMQPServer completes the AMQP 0-9-1 handshake + Channel.Open +
+// Confirm.Select, then drains incoming bytes without sending any replies (no
+// Basic.Ack, Channel.CloseOk, or Connection.CloseOk).
+func startBlackholeAMQPServer(t *testing.T) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen tcp: %v", err)
+	}
+
+	var mu sync.Mutex
+	var conns []net.Conn
+	closed := false
+	var wg sync.WaitGroup
+
+	t.Cleanup(func() {
+		mu.Lock()
+		closed = true
+		toClose := append([]net.Conn(nil), conns...)
+		conns = nil
+		mu.Unlock()
+
+		_ = ln.Close()
+		for _, c := range toClose {
+			_ = c.Close()
+		}
+		wg.Wait()
+	})
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+			if closed {
+				mu.Unlock()
+				_ = c.Close()
+				return
+			}
+			conns = append(conns, c)
+			mu.Unlock()
+
+			wg.Add(1)
+			go func(conn net.Conn) {
+				defer wg.Done()
+				defer conn.Close()
+
+				// 1. Read "AMQP\x00\x00\x09\x01"
+				var proto [8]byte
+				if _, err := io.ReadFull(conn, proto[:]); err != nil {
+					return
+				}
+
+				// 2. Send Connection.Start (10, 10)
+				var startArgs bytes.Buffer
+				startArgs.WriteByte(0)                                    // VersionMajor
+				startArgs.WriteByte(9)                                    // VersionMinor
+				_ = binary.Write(&startArgs, binary.BigEndian, uint32(0)) // empty ServerProperties table
+				_ = binary.Write(&startArgs, binary.BigEndian, uint32(5))
+				startArgs.WriteString("PLAIN")
+				_ = binary.Write(&startArgs, binary.BigEndian, uint32(5))
+				startArgs.WriteString("en_US")
+				if err := writeAMQPMethodFrame(conn, 0, 10, 10, startArgs.Bytes()); err != nil {
+					return
+				}
+
+				// 3. Read Connection.StartOk, send Connection.Tune (10, 30) with 10s heartbeat
+				if err := readAMQPFrame(conn); err != nil {
+					return
+				}
+				var tuneArgs bytes.Buffer
+				_ = binary.Write(&tuneArgs, binary.BigEndian, uint16(2047))   // ChannelMax
+				_ = binary.Write(&tuneArgs, binary.BigEndian, uint32(131072)) // FrameMax
+				_ = binary.Write(&tuneArgs, binary.BigEndian, uint16(10))     // Heartbeat (10s -> 15s un-deadlined timeout)
+				if err := writeAMQPMethodFrame(conn, 0, 10, 30, tuneArgs.Bytes()); err != nil {
+					return
+				}
+
+				// 4. Read Connection.TuneOk + Connection.Open, send Connection.OpenOk (10, 41)
+				if err := readAMQPFrame(conn); err != nil {
+					return
+				}
+				if err := readAMQPFrame(conn); err != nil {
+					return
+				}
+				if err := writeAMQPMethodFrame(conn, 0, 10, 41, []byte{0}); err != nil {
+					return
+				}
+
+				// 5. Read Channel.Open on ch 1, send Channel.OpenOk (20, 11)
+				if err := readAMQPFrame(conn); err != nil {
+					return
+				}
+				if err := writeAMQPMethodFrame(conn, 1, 20, 11, []byte{0, 0, 0, 0}); err != nil {
+					return
+				}
+
+				// 6. Read Confirm.Select on ch 1, send Confirm.SelectOk (85, 11)
+				if err := readAMQPFrame(conn); err != nil {
+					return
+				}
+				if err := writeAMQPMethodFrame(conn, 1, 85, 11, nil); err != nil {
+					return
+				}
+
+				// 7. Blackhole all subsequent frames: drain bytes, send nothing back.
+				_, _ = io.Copy(io.Discard, conn)
+			}(c)
+		}
+	}()
+
+	return fmt.Sprintf("amqp://guest:guest@%s/", ln.Addr().String())
+}
+
+func TestRabbitMQ_BlackholeTeardownBounded(t *testing.T) {
+	maxTeardown := closeTimeout + time.Second // 3s (vs 15s when Channel.Close runs first)
+
+	t.Run("PublishJob timeout teardown bounded by closeTimeout", func(t *testing.T) {
+		url := startBlackholeAMQPServer(t)
+		r, err := NewRabbitMQ(url)
+		if err != nil {
+			t.Fatalf("NewRabbitMQ failed: %v", err)
+		}
+		defer r.Close()
+
+		pubCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		err = r.PublishJob(pubCtx, "new_vacancies", djinni.Job{GUID: "blackhole-pub"})
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+		}
+		if elapsed > maxTeardown {
+			t.Fatalf("PublishJob teardown took %v (> %v); CloseDeadline likely bypassed", elapsed, maxTeardown)
+		}
+	})
+
+	t.Run("Close on blackholed broker bounded by closeTimeout", func(t *testing.T) {
+		url := startBlackholeAMQPServer(t)
+		r, err := NewRabbitMQ(url)
+		if err != nil {
+			t.Fatalf("NewRabbitMQ failed: %v", err)
+		}
+
+		start := time.Now()
+		r.Close()
+		elapsed := time.Since(start)
+
+		if elapsed > maxTeardown {
+			t.Fatalf("r.Close() took %v (> %v); CloseDeadline likely bypassed", elapsed, maxTeardown)
+		}
+
+		// Idempotent second Close and post-Close publish fail immediately.
+		secondStart := time.Now()
+		r.Close()
+		if time.Since(secondStart) > 100*time.Millisecond {
+			t.Fatalf("second r.Close() was not immediate")
+		}
+		if err := r.PublishJob(context.Background(), "new_vacancies", djinni.Job{GUID: "after-close"}); !errors.Is(err, errClientClosed) {
+			t.Fatalf("expected errClientClosed after Close, got %v", err)
+		}
 	})
 }

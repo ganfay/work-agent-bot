@@ -79,6 +79,10 @@ func (p *fakePublisher) PublishBatchEOF(_ context.Context, queueName string) err
 
 func testConfig(runOnce bool) *config.Config {
 	cfg := &config.Config{}
+	cfg.Database.Host = "localhost"
+	cfg.Database.Port = "5432"
+	cfg.RabbitMQ.Host = "localhost"
+	cfg.RabbitMQ.Port = "5672"
 	cfg.Scraper.RSSURL = "https://example.com/rss"
 	cfg.Scraper.LogPath = "logs/test.log"
 	cfg.Scraper.Interval = 50 * time.Millisecond
@@ -165,30 +169,43 @@ func TestRun_DaemonModeRunsUntilContextCancelledWithoutEOF(t *testing.T) {
 	repo := &fakeRepo{}
 	pub := &fakePublisher{}
 	cfg := testConfig(false)
-	cfg.Scraper.Interval = 15 * time.Millisecond
+	cfg.Scraper.Interval = 50 * time.Millisecond
 
-	var mu sync.Mutex
-	fetchCalls := 0
+	fetched := make(chan int, 4)
+	var fetchCalls atomic.Int32
 	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
-		mu.Lock()
-		fetchCalls++
-		mu.Unlock()
+		n := int(fetchCalls.Add(1))
+		fetched <- n
 		return nil, nil
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := run(ctx, cfg, repo, pub, "new_vacancies", fetcher); err != nil {
-		t.Fatalf("run returned unexpected error: %v", err)
+	tickCh := make(chan time.Time)
+	var stopped atomic.Bool
+	driverDone := make(chan struct{})
+	newTicker := func(_ time.Duration) (<-chan time.Time, func()) {
+		go func() {
+			defer close(driverDone)
+			<-fetched // initial iteration completed
+			tickCh <- time.Now()
+			<-fetched // periodic iteration completed
+			cancel()
+		}()
+		return tickCh, func() { stopped.Store(true) }
 	}
 
-	mu.Lock()
-	calls := fetchCalls
-	mu.Unlock()
+	if err := runWithTicker(ctx, cfg, repo, pub, "new_vacancies", fetcher, newTicker); err != nil {
+		t.Fatalf("runWithTicker returned unexpected error: %v", err)
+	}
+	<-driverDone
 
-	if calls < 2 {
-		t.Fatalf("expected daemon mode to run multiple iterations, got %d", calls)
+	if got := fetchCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 scrape iterations (initial + 1 tick), got %d", got)
+	}
+	if !stopped.Load() {
+		t.Fatal("expected ticker stop function to be called")
 	}
 	if len(pub.eofQueues) != 0 {
 		t.Fatalf("daemon mode must not publish batch EOF, got %+v", pub.eofQueues)

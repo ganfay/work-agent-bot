@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -190,6 +191,79 @@ func TestFetchJobs_RejectsOversizedFeedBody(t *testing.T) {
 		}
 		if jobs != nil {
 			t.Fatalf("expected nil jobs on oversized response, got %d", len(jobs))
+		}
+	})
+}
+
+func TestFetchJobs_RedactsURLCredentialsAndPreservesContextErrors(t *testing.T) {
+	t.Run("network error redacts userinfo and query values", func(t *testing.T) {
+		rssURL := "https://rss_user:SECRET_PASS@127.0.0.1:1/rss?token=QUERY_SECRET"
+		_, err := FetchJobs(context.Background(), rssURL)
+		if err == nil {
+			t.Fatal("expected error for unreachable server, got nil")
+		}
+		for _, secret := range []string{"rss_user", "SECRET_PASS", "QUERY_SECRET"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("expected error not to contain %q, got %q", secret, err.Error())
+			}
+		}
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			for _, secret := range []string{"rss_user", "SECRET_PASS", "QUERY_SECRET"} {
+				if strings.Contains(urlErr.URL, secret) {
+					t.Fatalf("expected urlErr.URL not to contain %q, got %q", secret, urlErr.URL)
+				}
+			}
+		}
+	})
+
+	t.Run("canceled context redacts URL secrets and preserves context.Canceled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		rssURL := "https://rss_user:SECRET_PASS@127.0.0.1:1/rss?token=QUERY_SECRET"
+		_, err := FetchJobs(ctx, rssURL)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected context.Canceled, got %v", err)
+		}
+		for _, secret := range []string{"rss_user", "SECRET_PASS", "QUERY_SECRET"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("expected error not to contain %q, got %q", secret, err.Error())
+			}
+		}
+	})
+
+	t.Run("deadline exceeded redacts URL secrets and preserves context.DeadlineExceeded", func(t *testing.T) {
+		unblock := make(chan struct{})
+		defer close(unblock)
+
+		srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			select {
+			case <-r.Context().Done():
+			case <-unblock:
+			}
+		}))
+		defer srv.Close()
+
+		parsed, err := url.Parse(srv.URL)
+		if err != nil {
+			t.Fatalf("parse server URL: %v", err)
+		}
+		parsed.User = url.UserPassword("rss_user", "SECRET_PASS")
+		parsed.Path = "/rss"
+		parsed.RawQuery = "token=QUERY_SECRET"
+
+		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+		defer cancel()
+
+		_, err = FetchJobs(ctx, parsed.String())
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected context.DeadlineExceeded, got %v", err)
+		}
+		for _, secret := range []string{"rss_user", "SECRET_PASS", "QUERY_SECRET"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("expected error not to contain %q, got %q", secret, err.Error())
+			}
 		}
 	})
 }

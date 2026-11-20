@@ -305,3 +305,153 @@ func TestConfig_PGSSLModeDefaultAndOverride(t *testing.T) {
 		}
 	})
 }
+
+func TestLoadConfig_DatabaseAndRabbitMQValidation(t *testing.T) {
+	tests := []struct {
+		name     string
+		envKey   string
+		envVal   string
+		wantErr  bool
+		checkCfg func(t *testing.T, cfg *Config)
+	}{
+		{name: "empty PG_HOST", envKey: "PG_HOST", envVal: "", wantErr: true},
+		{name: "whitespace PG_HOST", envKey: "PG_HOST", envVal: "   ", wantErr: true},
+		{name: "PG_HOST with whitespace", envKey: "PG_HOST", envVal: "pg host", wantErr: true},
+		{name: "PG_HOST with at-sign", envKey: "PG_HOST", envVal: "user@pg-host", wantErr: true},
+		{name: "PG_HOST with slash", envKey: "PG_HOST", envVal: "pg-host/db", wantErr: true},
+		{name: "PG_HOST with query", envKey: "PG_HOST", envVal: "pg-host?sslmode=disable", wantErr: true},
+		{name: "PG_HOST with fragment", envKey: "PG_HOST", envVal: "pg-host#frag", wantErr: true},
+		{name: "empty PG_USER", envKey: "PG_USER", envVal: "", wantErr: true},
+		{name: "whitespace PG_USER", envKey: "PG_USER", envVal: "   ", wantErr: true},
+		{name: "empty PG_DB", envKey: "PG_DB", envVal: "", wantErr: true},
+		{name: "whitespace PG_DB", envKey: "PG_DB", envVal: "   ", wantErr: true},
+		{name: "empty RMQ_HOST", envKey: "RMQ_HOST", envVal: "", wantErr: true},
+		{name: "whitespace RMQ_HOST", envKey: "RMQ_HOST", envVal: "   ", wantErr: true},
+		{name: "RMQ_HOST with whitespace", envKey: "RMQ_HOST", envVal: "rmq host", wantErr: true},
+		{name: "RMQ_HOST with at-sign", envKey: "RMQ_HOST", envVal: "user@rmq-host", wantErr: true},
+		{name: "RMQ_HOST with slash", envKey: "RMQ_HOST", envVal: "rmq-host/vhost", wantErr: true},
+		{name: "RMQ_HOST with query", envKey: "RMQ_HOST", envVal: "rmq-host?heartbeat=0", wantErr: true},
+		{name: "RMQ_HOST with fragment", envKey: "RMQ_HOST", envVal: "rmq-host#frag", wantErr: true},
+		{name: "empty RMQ_USER", envKey: "RMQ_USER", envVal: "", wantErr: true},
+		{name: "whitespace RMQ_USER", envKey: "RMQ_USER", envVal: "   ", wantErr: true},
+		{name: "empty PG_PORT", envKey: "PG_PORT", envVal: "", wantErr: true},
+		{name: "whitespace PG_PORT", envKey: "PG_PORT", envVal: "   ", wantErr: true},
+		{name: "zero PG_PORT", envKey: "PG_PORT", envVal: "0", wantErr: true},
+		{name: "negative PG_PORT", envKey: "PG_PORT", envVal: "-1", wantErr: true},
+		{name: "overflow PG_PORT", envKey: "PG_PORT", envVal: "65536", wantErr: true},
+		{name: "non-numeric PG_PORT", envKey: "PG_PORT", envVal: "badport", wantErr: true},
+		{name: "plus sign PG_PORT", envKey: "PG_PORT", envVal: "+5432", wantErr: true},
+		{name: "decimal PG_PORT", envKey: "PG_PORT", envVal: "54.32", wantErr: true},
+		{name: "empty RMQ_PORT", envKey: "RMQ_PORT", envVal: "", wantErr: true},
+		{name: "whitespace RMQ_PORT", envKey: "RMQ_PORT", envVal: "   ", wantErr: true},
+		{name: "zero RMQ_PORT", envKey: "RMQ_PORT", envVal: "0", wantErr: true},
+		{name: "negative RMQ_PORT", envKey: "RMQ_PORT", envVal: "-1", wantErr: true},
+		{name: "overflow RMQ_PORT", envKey: "RMQ_PORT", envVal: "65536", wantErr: true},
+		{name: "non-numeric RMQ_PORT", envKey: "RMQ_PORT", envVal: "badport", wantErr: true},
+		{name: "plus sign RMQ_PORT", envKey: "RMQ_PORT", envVal: "+5672", wantErr: true},
+		{name: "decimal RMQ_PORT", envKey: "RMQ_PORT", envVal: "56.72", wantErr: true},
+		{
+			name:   "PG_PORT lower bound 1",
+			envKey: "PG_PORT",
+			envVal: "1",
+			checkCfg: func(t *testing.T, cfg *Config) {
+				if cfg.Database.Port != "1" {
+					t.Fatalf("expected PG_PORT=1, got %q", cfg.Database.Port)
+				}
+			},
+		},
+		{
+			name:   "PG_PORT upper bound 65535",
+			envKey: "PG_PORT",
+			envVal: "65535",
+			checkCfg: func(t *testing.T, cfg *Config) {
+				if cfg.Database.Port != "65535" {
+					t.Fatalf("expected PG_PORT=65535, got %q", cfg.Database.Port)
+				}
+			},
+		},
+		{
+			name:   "PG_PORT trimmed whitespace",
+			envKey: "PG_PORT",
+			envVal: " 5432 ",
+			checkCfg: func(t *testing.T, cfg *Config) {
+				if cfg.Database.Port != "5432" {
+					t.Fatalf("expected normalized PG_PORT=5432, got %q", cfg.Database.Port)
+				}
+			},
+		},
+		{
+			name:   "RMQ_PORT lower bound 1",
+			envKey: "RMQ_PORT",
+			envVal: "1",
+			checkCfg: func(t *testing.T, cfg *Config) {
+				if cfg.RabbitMQ.Port != "1" {
+					t.Fatalf("expected RMQ_PORT=1, got %q", cfg.RabbitMQ.Port)
+				}
+			},
+		},
+		{
+			name:   "RMQ_PORT upper bound 65535",
+			envKey: "RMQ_PORT",
+			envVal: "65535",
+			checkCfg: func(t *testing.T, cfg *Config) {
+				if cfg.RabbitMQ.Port != "65535" {
+					t.Fatalf("expected RMQ_PORT=65535, got %q", cfg.RabbitMQ.Port)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			setRequiredScraperEnv(t)
+			t.Setenv(tc.envKey, tc.envVal)
+
+			cfg, err := LoadConfig("/nonexistent/.env")
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %s=%q, got nil", tc.envKey, tc.envVal)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error for %s=%q: %v", tc.envKey, tc.envVal, err)
+			}
+			if tc.checkCfg != nil {
+				tc.checkCfg(t, cfg)
+			}
+		})
+	}
+
+	t.Run("invalid RMQ_PORT error does not expose RMQ_PASS", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		setRequiredScraperEnv(t)
+		t.Setenv("RMQ_PASS", "SUPER_SECRET_PASS")
+		t.Setenv("RMQ_PORT", "badport")
+
+		_, err := LoadConfig("/nonexistent/.env")
+		if err == nil {
+			t.Fatal("expected error for RMQ_PORT=badport, got nil")
+		}
+		if strings.Contains(err.Error(), "SUPER_SECRET_PASS") {
+			t.Fatalf("expected LoadConfig error not to contain RMQ_PASS, got %q", err.Error())
+		}
+	})
+
+	t.Run("malformed DJINNI_RSS_URL error redacts credentials and query tokens", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		setRequiredScraperEnv(t)
+		t.Setenv("DJINNI_RSS_URL", "https://rss_user:RSS_SECRET_PASS@bad[host/rss?token=RSS_QUERY_TOKEN")
+
+		_, err := LoadConfig("/nonexistent/.env")
+		if err == nil {
+			t.Fatal("expected error for malformed DJINNI_RSS_URL, got nil")
+		}
+		for _, secret := range []string{"RSS_SECRET_PASS", "rss_user", "RSS_QUERY_TOKEN"} {
+			if strings.Contains(err.Error(), secret) {
+				t.Fatalf("expected LoadConfig error not to contain %q, got %q", secret, err.Error())
+			}
+		}
+	})
+}

@@ -86,6 +86,38 @@ func TestNewJobRepository_InvalidDSN(t *testing.T) {
 	}
 }
 
+func TestNewJobRepository_MalformedDSNRedactsCredentials(t *testing.T) {
+	t.Run("non-postgres scheme with multiple colons in password", func(t *testing.T) {
+		_, err := NewJobRepository("pg://u:sec:ret@localhost/db")
+		if err == nil {
+			t.Fatal("expected error for malformed DSN, got nil")
+		}
+		if strings.Contains(err.Error(), "sec") || strings.Contains(err.Error(), "ret") {
+			t.Fatalf("expected malformed DSN credentials redacted from error, got %q", err.Error())
+		}
+		var parseErr *pgconn.ParseConfigError
+		if errors.As(err, &parseErr) {
+			if strings.Contains(parseErr.ConnString, "sec") || strings.Contains(parseErr.ConnString, "ret") {
+				t.Fatalf("expected parseErr.ConnString redacted, got %q", parseErr.ConnString)
+			}
+		}
+	})
+
+	t.Run("keyword-value DSN with invalid port redacts password", func(t *testing.T) {
+		_, err := NewJobRepository("host=localhost user=u password=SUPER_PG_SECRET port=badport")
+		if err == nil {
+			t.Fatal("expected error for invalid keyword-value DSN, got nil")
+		}
+		if strings.Contains(err.Error(), "SUPER_PG_SECRET") {
+			t.Fatalf("expected keyword-value password redacted from error, got %q", err.Error())
+		}
+		var parseErr *pgconn.ParseConfigError
+		if errors.As(err, &parseErr) && strings.Contains(parseErr.ConnString, "SUPER_PG_SECRET") {
+			t.Fatalf("expected parseErr.ConnString redacted, got %q", parseErr.ConnString)
+		}
+	})
+}
+
 func TestNewJobRepository_OpenerAndPingHandling(t *testing.T) {
 	t.Run("opener error propagates", func(t *testing.T) {
 		wantErr := errors.New("dial failed")
