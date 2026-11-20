@@ -4,6 +4,7 @@ CODEBASE INDEXER SCRIPT
 генерує для них векторні ембединги і записує в PostgreSQL у таблицю code_embeddings.
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -16,10 +17,9 @@ from pgvector import Vector
 from pgvector.psycopg2 import register_vector
 
 from config.config import settings
-from core.logger import setup_logger
 from rag.embedder import embedder
 
-logger = setup_logger(settings.log_path)
+logger = logging.getLogger("ai_worker")
 
 MAX_PROJECT_NAME_LEN = 100
 MAX_CATEGORY_LEN = 50
@@ -96,4 +96,10 @@ def index_knowledge_base():
 
 
 if __name__ == "__main__":
-    index_knowledge_base()
+    from core.logger import setup_logger
+
+    setup_logger(settings.log_path)
+    try:
+        index_knowledge_base()
+    finally:
+        embedder.close()

@@ -1,7 +1,9 @@
 import logging
 from typing import List, Optional
-from pydantic import BaseModel, Field
+import httpx
+from pydantic import BaseModel, Field, ValidationError
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 from agents.validator import ValidationResult
@@ -45,6 +47,10 @@ class CritiqueResult(BaseModel):
     )
     final_letter: str = Field(
         description="The final de-AI-ified, polished, highly professional cover letter ready for Telegram review"
+    )
+    fallback_used: bool = Field(
+        default=False,
+        description="Internal flag indicating review failed and unreviewed draft was returned",
     )
 
 
@@ -158,19 +164,30 @@ class CoverLetterCritic:
 
         try:
             result: CritiqueResult = call_with_retry(_call, operation="CoverLetterCritic.review")
+            result.fallback_used = False
             logger.info(
                 f"[Critic] Audit complete: Score={result.critique_score}/100, Fluff={result.fluff_percentage}%, AI-cliches={len(result.ai_cliches_detected)}"
             )
             return result
 
-        except Exception as err:
-            logger.warning(f"[Critic] Review failed after retries; falling back to validated draft: {err}")
+        except (
+            genai_errors.APIError,
+            httpx.HTTPError,
+            ValidationError,
+            RuntimeError,
+            TimeoutError,
+            ConnectionError,
+            OSError,
+            ValueError,
+        ) as err:
+            logger.warning(f"[Critic] Review failed after retries; falling back to unreviewed draft: {err}")
             return CritiqueResult(
                 is_approved=False,
-                critique_score=70,
+                critique_score=0,
                 fluff_percentage=0,
                 ai_cliches_detected=[],
                 hallucinations_detected=[],
                 grammar_and_syntax_notes=["Fallback: audit skipped due to API error"],
                 final_letter=draft.cover_letter,
+                fallback_used=True,
             )

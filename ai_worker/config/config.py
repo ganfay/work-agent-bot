@@ -67,12 +67,18 @@ class Config:
             CURRENT_DIR.parent / "candidate_profile.json",
         ]
         for p in paths:
-            if p.exists():
-                try:
-                    with open(p, "r", encoding="utf-8") as f:
-                        return json.load(f)
-                except Exception:
-                    pass
+            if not p.exists():
+                continue
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except json.JSONDecodeError as err:
+                raise ValueError(f"Invalid JSON in candidate profile '{p}': {err}") from err
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"Candidate profile '{p}' must be a JSON object, got {type(data).__name__}"
+                )
+            return data
         return {}
 
     def rabbitmq_url(self) -> str:

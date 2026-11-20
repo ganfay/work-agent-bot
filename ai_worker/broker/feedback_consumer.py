@@ -53,7 +53,21 @@ def get_recent_feedback_reasons(limit: int = 5) -> list[str]:
             conn.close()
 
 
-def _persist_feedback(pg_url: str | None, job_title: str, reason: str, conn=None):
+def _normalize_status(raw_status) -> str:
+    if isinstance(raw_status, str):
+        cleaned = raw_status.strip().lower()
+        if cleaned and len(cleaned) <= 20:
+            return cleaned
+    return "rejected"
+
+
+def _persist_feedback(
+    pg_url: str | None,
+    job_title: str,
+    reason: str,
+    status: str = "rejected",
+    conn=None,
+):
     owned_conn = conn is None
     if conn is not None:
         db_conn = conn
@@ -62,13 +76,14 @@ def _persist_feedback(pg_url: str | None, job_title: str, reason: str, conn=None
     else:
         db_conn = psycopg2.connect(**settings.pg_connect_kwargs())
     cur = db_conn.cursor()
+    normalized_status = _normalize_status(status)
     try:
         cur.execute(
             """
             INSERT INTO user_feedback (job_title, reason, status)
-            VALUES (%s, %s, 'rejected');
+            VALUES (%s, %s, %s);
             """,
-            (job_title, reason),
+            (job_title, reason, normalized_status),
         )
         db_conn.commit()
     except Exception:
@@ -116,6 +131,7 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                             raise ValueError("feedback payload must be a JSON object")
                         job_title = str(data.get("job_title", "Unknown"))
                         reason = str(data.get("reason", "No reason"))
+                        status = _normalize_status(data.get("status"))
                     except Exception as e:
                         logger.error(f"[FeedbackEngine] Invalid feedback payload: {e}")
                         _route_feedback_to_dlq(ch, method.delivery_tag, body, f"invalid_payload: {e}")
@@ -123,7 +139,7 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
 
                     try:
                         logger.info(f"[FeedbackEngine] Captured human rejection for '{job_title}': '{reason}'")
-                        _persist_feedback(None, job_title, reason)
+                        _persist_feedback(None, job_title, reason, status=status)
                         safe_ack(ch, method.delivery_tag)
                         logger.info("[FeedbackEngine] Stored feedback in PostgreSQL successfully.")
                     except Exception as e:
@@ -185,6 +201,21 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
         channel.queue_declare(queue="feedback_queue", durable=True)
         channel.queue_declare(queue=FEEDBACK_DLQ_NAME, durable=True)
 
+        def _open_pg_conn():
+            if db_url:
+                return psycopg2.connect(db_url, connect_timeout=10, options="-c statement_timeout=15000")
+            return psycopg2.connect(**settings.pg_connect_kwargs())
+
+        def _close_pg_conn():
+            nonlocal pg_conn
+            if pg_conn is not None:
+                try:
+                    pg_conn.close()
+                except Exception:
+                    pass
+                finally:
+                    pg_conn = None
+
         while True:
             method_frame, _, body = channel.basic_get(queue="feedback_queue", auto_ack=False)
             if method_frame is None:
@@ -195,21 +226,46 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
                     raise ValueError("feedback payload must be a JSON object")
                 job_title = str(data.get("job_title", "Unknown"))
                 reason = str(data.get("reason", "No reason"))
+                status = _normalize_status(data.get("status"))
+            except Exception as e:
+                logger.error(f"[FeedbackEngine] Invalid drained feedback payload: {redact_url(e)}")
+                _route_feedback_to_dlq(channel, method_frame.delivery_tag, body, f"invalid_payload: {e}")
+                continue
 
+            try:
                 if pg_conn is None or getattr(pg_conn, "closed", 0):
-                    if db_url:
-                        pg_conn = psycopg2.connect(db_url, connect_timeout=10, options="-c statement_timeout=15000")
-                    else:
-                        pg_conn = psycopg2.connect(**settings.pg_connect_kwargs())
-
-                _persist_feedback(db_url, job_title, reason, conn=pg_conn)
-
-                safe_ack(channel, method_frame.delivery_tag)
-                processed += 1
-                logger.info(f"[FeedbackEngine] Drained feedback for '{job_title}': '{reason}'")
+                    pg_conn = _open_pg_conn()
+                _persist_feedback(db_url, job_title, reason, status=status, conn=pg_conn)
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
+                logger.warning(
+                    f"[FeedbackEngine] PostgreSQL connection error while draining; reconnecting once: "
+                    f"{redact_url(db_err)}"
+                )
+                _close_pg_conn()
+                try:
+                    pg_conn = _open_pg_conn()
+                    _persist_feedback(db_url, job_title, reason, status=status, conn=pg_conn)
+                except Exception as retry_err:
+                    logger.error(
+                        f"[FeedbackEngine] Retry failed draining feedback message: {redact_url(retry_err)}"
+                    )
+                    if isinstance(retry_err, (psycopg2.OperationalError, psycopg2.InterfaceError)):
+                        _close_pg_conn()
+                    _route_feedback_to_dlq(
+                        channel,
+                        method_frame.delivery_tag,
+                        body,
+                        f"drain_db_error: {retry_err}",
+                    )
+                    continue
             except Exception as e:
                 logger.error(f"[FeedbackEngine] Error draining feedback message: {redact_url(e)}")
                 _route_feedback_to_dlq(channel, method_frame.delivery_tag, body, f"drain_error: {e}")
+                continue
+
+            safe_ack(channel, method_frame.delivery_tag)
+            processed += 1
+            logger.info(f"[FeedbackEngine] Drained feedback for '{job_title}': '{reason}'")
     except Exception as e:
         logger.error(f"[FeedbackEngine] Failed to drain feedback_queue: {redact_url(e)}")
     finally:

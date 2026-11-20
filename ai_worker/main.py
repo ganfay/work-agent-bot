@@ -2,6 +2,7 @@ import re
 import signal
 import sys
 import threading
+import time
 import psycopg2
 
 from broker.consumer import RabbitMQConsumer
@@ -30,44 +31,74 @@ from rag.indexer import index_knowledge_base
 logger = setup_logger(settings.log_path)
 
 # 2. Self-healing check: ensure pgvector has codebase embeddings
-def ensure_embeddings_exist():
-    conn = None
-    try:
-        conn = psycopg2.connect(**settings.pg_connect_kwargs(statement_timeout_ms=30000))
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE EXTENSION IF NOT EXISTS vector;
-                    CREATE TABLE IF NOT EXISTS code_embeddings (
-                        id SERIAL PRIMARY KEY,
-                        project_name VARCHAR(100) NOT NULL,
-                        category VARCHAR(50) NOT NULL,
-                        content TEXT NOT NULL,
-                        embedding vector(768) NOT NULL,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                    CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx
-                    ON code_embeddings USING hnsw (embedding vector_cosine_ops);
-                    CREATE TABLE IF NOT EXISTS user_feedback (
-                        id SERIAL PRIMARY KEY,
-                        job_title TEXT NOT NULL,
-                        reason TEXT NOT NULL,
-                        status VARCHAR(20) DEFAULT 'rejected',
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    );
-                """)
-                cur.execute("SELECT COUNT(*) FROM code_embeddings;")
-                count = cur.fetchone()[0]
-        if count == 0:
-            logger.warning("[RAG] Vector database is empty! Triggering automatic indexing...")
+def ensure_embeddings_exist(max_attempts: int = 5, base_delay: float = 2.0):
+    count = None
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        conn = None
+        try:
+            conn = psycopg2.connect(**settings.pg_connect_kwargs(statement_timeout_ms=30000))
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE EXTENSION IF NOT EXISTS vector;
+                        CREATE TABLE IF NOT EXISTS code_embeddings (
+                            id SERIAL PRIMARY KEY,
+                            project_name VARCHAR(100) NOT NULL,
+                            category VARCHAR(50) NOT NULL,
+                            content TEXT NOT NULL,
+                            embedding vector(768) NOT NULL,
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                        CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx
+                        ON code_embeddings USING hnsw (embedding vector_cosine_ops);
+                        CREATE TABLE IF NOT EXISTS user_feedback (
+                            id SERIAL PRIMARY KEY,
+                            job_title TEXT NOT NULL,
+                            reason TEXT NOT NULL,
+                            status VARCHAR(20) DEFAULT 'rejected',
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        );
+                    """)
+                    cur.execute("SELECT COUNT(*) FROM code_embeddings;")
+                    count = cur.fetchone()[0]
+            last_err = None
+            break
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as err:
+            last_err = err
+            if attempt >= max_attempts:
+                logger.critical(
+                    f"[RAG] PostgreSQL unreachable after {max_attempts} startup attempts: {redact_url(err)}"
+                )
+                raise
+            delay = base_delay * attempt
+            logger.warning(
+                f"[RAG] PostgreSQL not ready (attempt {attempt}/{max_attempts}): {redact_url(err)}. "
+                f"Retrying in {delay:.1f}s..."
+            )
+            time.sleep(delay)
+        except Exception as err:
+            logger.critical(f"[RAG] Fatal error checking vector database: {redact_url(err)}")
+            raise
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    if last_err is not None:
+        raise last_err
+
+    if count == 0:
+        logger.warning("[RAG] Vector database is empty! Triggering automatic indexing...")
+        try:
             index_knowledge_base()
-        else:
-            logger.info(f"[RAG] Vector database initialized with {count} code chunks.")
-    except Exception as e:
-        logger.error(f"[RAG] Error checking vector database: {e}")
-    finally:
-        if conn is not None:
-            conn.close()
+        except Exception as err:
+            logger.critical(f"[RAG] Automatic knowledge base indexing failed: {redact_url(err)}")
+            raise
+    else:
+        logger.info(f"[RAG] Vector database initialized with {count} code chunks.")
 
 genai_client = None
 analyzer = None
@@ -170,11 +201,23 @@ def process_vacancy(job: dict, publisher_func):
     # ----------------------------------------------------
     # PUBLISH TO REVIEW QUEUE (For Go Telegram Bot HITL)
     # ----------------------------------------------------
+    summary = analysis.summary
+    if getattr(critique, "fallback_used", False):
+        logger.warning(f"[Critic] Fallback used for '{title}'; flagging summary for human review.")
+        summary = f"[⚠️ Critic audit skipped — unreviewed draft] {summary}"
+    elif getattr(critique, "hallucinations_detected", None) or not getattr(critique, "is_approved", True):
+        hallucinations = getattr(critique, "hallucinations_detected", None) or []
+        logger.warning(
+            f"[Critic] Draft flagged for '{title}' "
+            f"(approved={critique.is_approved}, hallucinations={len(hallucinations)})."
+        )
+        summary = f"[⚠️ Critic flagged draft (approved={critique.is_approved})] {summary}"
+
     review_payload = {
         "title": title,
         "link": link,
         "match_score": analysis.match_score,
-        "summary": analysis.summary,
+        "summary": summary,
         "pros": analysis.pros,
         "fluff_percentage": critique.fluff_percentage,
         "final_letter": critique.final_letter,

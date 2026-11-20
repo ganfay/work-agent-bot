@@ -4,15 +4,36 @@ Shared LLM / Embedding call helpers with exponential backoff for transient API e
 
 import logging
 import random
+import re
 import time
 from typing import Callable, TypeVar
 
+import httpx
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 
 logger = logging.getLogger("ai_worker")
 
 DEFAULT_GEMINI_TIMEOUT_MS = 30_000
+
+T = TypeVar("T")
+
+_TRANSIENT_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
+_TRANSIENT_STATUS_RE = re.compile(r"\b(?:429|500|502|503|504)\b")
+_TRANSIENT_PHRASES = (
+    "resource_exhausted",
+    "rate limit",
+    "too many requests",
+    "service unavailable",
+    "deadline exceeded",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection refused",
+    "connection aborted",
+    "temporarily unavailable",
+)
 
 
 def create_genai_client(api_key: str, timeout_ms: int = DEFAULT_GEMINI_TIMEOUT_MS) -> genai.Client:
@@ -22,30 +43,39 @@ def create_genai_client(api_key: str, timeout_ms: int = DEFAULT_GEMINI_TIMEOUT_M
         http_options=types.HttpOptions(timeout=timeout_ms),
     )
 
-T = TypeVar("T")
-
-_TRANSIENT_MARKERS = (
-    "429",
-    "500",
-    "502",
-    "503",
-    "504",
-    "resource_exhausted",
-    "rate limit",
-    "quota",
-    "unavailable",
-    "deadline",
-    "timeout",
-    "connection",
-)
-
 
 def is_transient_error(err: Exception) -> bool:
-    code = getattr(err, "code", None) or getattr(err, "status_code", None)
-    if isinstance(code, int) and code in (429, 500, 502, 503, 504):
+    if isinstance(err, (ValueError, TypeError, KeyError, AttributeError)):
+        return False
+
+    if isinstance(
+        err,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            TimeoutError,
+            ConnectionError,
+        ),
+    ):
         return True
+
+    if isinstance(err, genai_errors.APIError):
+        return err.code in _TRANSIENT_HTTP_CODES
+
+    code = getattr(err, "code", None)
+    if code is None:
+        code = getattr(err, "status_code", None)
+    if code is None:
+        resp = getattr(err, "response", None)
+        code = getattr(resp, "status_code", None) if resp is not None else None
+    if isinstance(code, int):
+        return code in _TRANSIENT_HTTP_CODES
+
     msg = str(err).lower()
-    return any(marker in msg for marker in _TRANSIENT_MARKERS)
+    if _TRANSIENT_STATUS_RE.search(msg):
+        return True
+    return any(phrase in msg for phrase in _TRANSIENT_PHRASES)
 
 
 def call_with_retry(

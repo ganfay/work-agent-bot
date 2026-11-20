@@ -10,7 +10,7 @@ AGENT 1: VACANCY ANALYZER (Рекрутер на першій лінії з ди
 
 import logging
 from typing import List, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from google import genai
 from google.genai import types
 
@@ -48,6 +48,17 @@ class AnalysisResult(BaseModel):
     summary: str = Field(
         description="Brief 1-2 sentence summary of the evaluation"
     )
+
+    @model_validator(mode="after")
+    def enforce_decision_consistency(self) -> "AnalysisResult":
+        expected: Literal["PROCEED", "SKIP"] = "PROCEED" if self.match_score >= 60 else "SKIP"
+        if self.decision != expected:
+            logger.warning(
+                f"[Analyzer] Overriding inconsistent decision '{self.decision}' -> '{expected}' "
+                f"for match_score={self.match_score}"
+            )
+            self.decision = expected
+        return self
 
 
 class VacancyAnalyzer:
