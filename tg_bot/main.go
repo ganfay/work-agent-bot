@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,45 +25,133 @@ import (
 	"tg_bot/pkg/logger"
 )
 
-func main() {
-	cfg, err := config.LoadConfig("../.env")
-	if err != nil {
-		slog.Error("failed to load bot configuration", "error", err)
-		os.Exit(1)
+type appBroker interface {
+	ProposalConsumer
+	DLQPublisher
+	SendFeedback(jobTitle, reason string) error
+	Close()
+}
+
+type appBot interface {
+	ProposalSender
+	StartAsync() <-chan struct{}
+	Stop()
+}
+
+type retryConfig struct {
+	maxAttempts    int
+	initialBackoff time.Duration
+	maxBackoff     time.Duration
+}
+
+func defaultRetryConfig() retryConfig {
+	return retryConfig{
+		maxAttempts:    5,
+		initialBackoff: 1 * time.Second,
+		maxBackoff:     10 * time.Second,
 	}
+}
 
-	logger.Setup(cfg.Bot.LogPath)
-	slog.Info("starting telegram bot service")
+type appDeps struct {
+	loadConfig  func(envPath string) (*config.Config, error)
+	setupLogger func(filePath string) (*slog.Logger, io.Closer, error)
+	newBroker   func(url string) (appBroker, error)
+	newBot      func(token string, allowedUserID int64, rabbit appBroker) (appBot, error)
+	retryCfg    retryConfig
+}
 
+func defaultAppDeps() appDeps {
+	return appDeps{
+		loadConfig:  config.LoadConfig,
+		setupLogger: logger.Setup,
+		newBroker: func(url string) (appBroker, error) {
+			return broker.NewRabbitMQ(url)
+		},
+		newBot: func(token string, allowedUserID int64, rabbit appBroker) (appBot, error) {
+			rmq, ok := rabbit.(*broker.RabbitMQ)
+			if !ok || rmq == nil {
+				return nil, errors.New("invalid rabbitmq broker instance")
+			}
+			return bot.New(token, allowedUserID, rmq)
+		},
+		retryCfg: defaultRetryConfig(),
+	}
+}
+
+func main() {
+	os.Exit(runCLI())
+}
+
+func runCLI() int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	rmq, err := broker.NewRabbitMQ(cfg.RabbitMQURL())
+	if err := runApp(ctx, "../.env", defaultAppDeps()); err != nil {
+		return 1
+	}
+	return 0
+}
+
+func isPermanentTelegramInitError(err error) bool {
+	return errors.Is(err, tele.ErrUnauthorized) || errors.Is(err, tele.ErrNotFound)
+}
+
+func runApp(ctx context.Context, envPath string, deps appDeps) error {
+	cfg, err := deps.loadConfig(envPath)
+	if err != nil {
+		slog.Error("failed to load bot configuration", "error", err)
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	_, logCloser, err := deps.setupLogger(cfg.Bot.LogPath)
+	if err != nil {
+		slog.Error("failed to initialize logger", "error", err)
+		return fmt.Errorf("setup logger: %w", err)
+	}
+	if logCloser != nil {
+		defer func() {
+			if closeErr := logCloser.Close(); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "failed to close logger: %v\n", closeErr)
+			}
+		}()
+	}
+	slog.Info("starting telegram bot service")
+
+	rmq, err := retryConnect(ctx, "rabbitmq", deps.retryCfg, nil, func() (appBroker, error) {
+		return deps.newBroker(cfg.RabbitMQURL())
+	})
 	if err != nil {
 		slog.Error("failed to connect to rabbitmq", "error", err)
-		os.Exit(1)
+		return err
 	}
-	defer rmq.Close()
+	defer func() {
+		slog.Info("closing rabbitmq connection and channels...")
+		rmq.Close()
+	}()
 
-	telegramBot, err := bot.New(cfg.Telegram.BotToken, cfg.Telegram.UserID, rmq)
+	telegramBot, err := retryConnect(ctx, "telegram", deps.retryCfg, isPermanentTelegramInitError, func() (appBot, error) {
+		return deps.newBot(cfg.Telegram.BotToken, cfg.Telegram.UserID, rmq)
+	})
 	if err != nil {
 		slog.Error("failed to initialize telegram bot", "error", err)
-		os.Exit(1)
+		return err
 	}
 
-	go telegramBot.Start()
-	defer telegramBot.Stop()
+	msgs, err := rmq.ConsumeProposals(ctx)
+	if err != nil {
+		slog.Error("failed to start consuming review_queue", "error", err)
+		return fmt.Errorf("consume review_queue: %w", err)
+	}
+
+	telegramBot.StartAsync()
+	defer func() {
+		slog.Info("stopping telegram bot...")
+		telegramBot.Stop()
+	}()
 
 	slog.Info("telegram bot service started", "run_once", cfg.Bot.RunOnce)
 	var loopErr error
 	if cfg.Bot.RunOnce {
-		msgs, err := rmq.ConsumeProposals(ctx)
-		if err != nil {
-			slog.Error("failed to start consuming review_queue", "error", err)
-			telegramBot.Stop()
-			rmq.Close()
-			os.Exit(1)
-		}
 		loopErr = runConsumerLoop(
 			ctx,
 			msgs,
@@ -74,22 +164,84 @@ func main() {
 			defaultSendRetryConfig(),
 		)
 	} else {
-		loopErr = runDaemonConsumerLoop(
+		loopErr = runDaemonConsumerLoopWithInitial(
 			ctx,
+			msgs,
 			rmq,
 			telegramBot,
 			rmq,
 			cfg.Telegram.UserID,
 			defaultSendRetryConfig(),
+			initialReconnectBackoff,
+			maxReconnectBackoff,
+			sleepWithContext,
 		)
 	}
 	if loopErr != nil {
 		slog.Error("consumer loop terminated with error", "error", loopErr)
-		telegramBot.Stop()
-		rmq.Close()
-		os.Exit(1)
+		return loopErr
 	}
 	slog.Info("shutdown complete: closing connections...")
+	return nil
+}
+
+func retryConnect[T any](
+	ctx context.Context,
+	name string,
+	cfg retryConfig,
+	isPermanent func(error) bool,
+	connect func() (T, error),
+) (T, error) {
+	var zero T
+	maxAttempts := cfg.maxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 1
+	}
+	backoff := cfg.initialBackoff
+	var lastErr error
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return zero, fmt.Errorf("%s initialization cancelled: %w", name, err)
+		}
+
+		res, err := connect()
+		if err == nil {
+			return res, nil
+		}
+		if isPermanent != nil && isPermanent(err) {
+			return zero, fmt.Errorf("%s permanent failure: %w", name, err)
+		}
+		lastErr = err
+
+		if attempt == maxAttempts {
+			break
+		}
+
+		slog.Warn("dependency connection attempt failed; retrying",
+			"dependency", name,
+			"attempt", attempt,
+			"max_attempts", maxAttempts,
+			"backoff", backoff.String(),
+			"error", err,
+		)
+
+		if backoff > 0 {
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return zero, fmt.Errorf("%s startup retry cancelled: %w (last error: %v)", name, ctx.Err(), lastErr)
+			case <-timer.C:
+			}
+			backoff *= 2
+			if cfg.maxBackoff > 0 && backoff > cfg.maxBackoff {
+				backoff = cfg.maxBackoff
+			}
+		}
+	}
+
+	return zero, fmt.Errorf("%s failed after %d attempt(s): %w", name, maxAttempts, lastErr)
 }
 
 var errBrokerChannelClosed = errors.New("review_queue channel closed unexpectedly")
@@ -368,6 +520,32 @@ func runDaemonConsumerLoopWithBackoff(
 	maxBackoff time.Duration,
 	sleepFn func(ctx context.Context, d time.Duration) error,
 ) error {
+	return runDaemonConsumerLoopWithInitial(
+		ctx,
+		nil,
+		consumer,
+		sender,
+		dlq,
+		userID,
+		retryCfg,
+		initialBackoff,
+		maxBackoff,
+		sleepFn,
+	)
+}
+
+func runDaemonConsumerLoopWithInitial(
+	ctx context.Context,
+	initialMsgs <-chan amqp.Delivery,
+	consumer ProposalConsumer,
+	sender ProposalSender,
+	dlq DLQPublisher,
+	userID int64,
+	retryCfg sendRetryConfig,
+	initialBackoff time.Duration,
+	maxBackoff time.Duration,
+	sleepFn func(ctx context.Context, d time.Duration) error,
+) error {
 	if initialBackoff <= 0 {
 		initialBackoff = initialReconnectBackoff
 	}
@@ -379,29 +557,37 @@ func runDaemonConsumerLoopWithBackoff(
 	}
 
 	backoff := initialBackoff
+	nextMsgs := initialMsgs
 	for {
 		if ctx.Err() != nil {
 			return nil
 		}
 
-		msgs, err := consumer.ConsumeProposals(ctx)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil
+		var msgs <-chan amqp.Delivery
+		if nextMsgs != nil {
+			msgs = nextMsgs
+			nextMsgs = nil
+		} else {
+			var err error
+			msgs, err = consumer.ConsumeProposals(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				slog.Warn("failed to consume review_queue; retrying", "backoff", backoff.String(), "error", err)
+				if sleepErr := sleepFn(ctx, backoff); sleepErr != nil {
+					return nil
+				}
+				backoff *= 2
+				if backoff > maxBackoff {
+					backoff = maxBackoff
+				}
+				continue
 			}
-			slog.Warn("failed to consume review_queue; retrying", "backoff", backoff.String(), "error", err)
-			if sleepErr := sleepFn(ctx, backoff); sleepErr != nil {
-				return nil
-			}
-			backoff *= 2
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			continue
 		}
 
 		connectedAt := time.Now()
-		err = runConsumerLoop(ctx, msgs, sender, dlq, userID, false, 0, 0, retryCfg)
+		err := runConsumerLoop(ctx, msgs, sender, dlq, userID, false, 0, 0, retryCfg)
 		if err == nil || ctx.Err() != nil {
 			return nil
 		}

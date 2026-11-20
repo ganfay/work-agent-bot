@@ -1,13 +1,18 @@
 package bot
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
+	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"tg_bot/internal/broker"
@@ -16,9 +21,25 @@ import (
 )
 
 const (
-	maxTitleRunes   = 200
-	maxSummaryRunes = 700
-	maxLetterRunes  = 2200
+	maxTitleRunes     = 200
+	maxSummaryRunes   = 700
+	maxLetterRunes    = 2200
+	maxProItemRunes   = 160
+	maxProsCount      = 5
+	maxProsTotalUTF16 = 450
+	maxBaseUTF16      = 3900
+	maxBaseRawRunes   = 3900
+	maxActionStates   = 1000
+
+	rejectPromptText = "\n\nВкажіть причину відхилення для навчання ШІ:"
+)
+
+type actionState uint8
+
+const (
+	actionIdle actionState = iota
+	actionPending
+	actionDone
 )
 
 func isValidHTTPURL(raw string) bool {
@@ -29,15 +50,107 @@ func isValidHTTPURL(raw string) bool {
 	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
-func truncateRunes(s string, maxRunes int) string {
-	if maxRunes <= 0 || utf8.RuneCountInString(s) <= maxRunes {
+func utf16Len(s string) int {
+	total := 0
+	for _, r := range s {
+		n := utf16.RuneLen(r)
+		if n < 0 {
+			n = 1
+		}
+		total += n
+	}
+	return total
+}
+
+func truncateUTF16(s string, maxUnits int) string {
+	if maxUnits <= 0 {
+		return ""
+	}
+	if utf16Len(s) <= maxUnits {
+		return s
+	}
+	if maxUnits == 1 {
+		return "…"
+	}
+	limit := maxUnits - 1
+	var b strings.Builder
+	units := 0
+	for _, r := range s {
+		n := utf16.RuneLen(r)
+		if n < 0 {
+			n = 1
+		}
+		if units+n > limit {
+			break
+		}
+		b.WriteRune(r)
+		units += n
+	}
+	b.WriteRune('…')
+	return b.String()
+}
+
+func shrinkEscapedToRawBudget(s string, maxEscapedRunes int) string {
+	if maxEscapedRunes <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(html.EscapeString(s)) <= maxEscapedRunes {
 		return s
 	}
 	runes := []rune(s)
-	if maxRunes == 1 {
-		return "…"
+	if maxEscapedRunes == 1 {
+		if utf8.RuneCountInString(html.EscapeString("…")) <= maxEscapedRunes {
+			return "…"
+		}
+		return ""
 	}
-	return string(runes[:maxRunes-1]) + "…"
+	lo, hi := 0, len(runes)
+	best := ""
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		candidate := string(runes[:mid])
+		if mid < len(runes) && mid > 0 {
+			candidate = string(runes[:mid-1]) + "…"
+		}
+		if utf8.RuneCountInString(html.EscapeString(candidate)) <= maxEscapedRunes {
+			best = candidate
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
+}
+
+type notifyPoller struct {
+	inner tele.Poller
+	once  sync.Once
+	ready chan struct{}
+}
+
+func (p *notifyPoller) Poll(b *tele.Bot, updates chan tele.Update, stop chan struct{}) {
+	p.once.Do(func() { close(p.ready) })
+	p.inner.Poll(b, updates, stop)
+}
+
+type cancelUpdatesTransport struct {
+	base    http.RoundTripper
+	pollCtx context.Context
+}
+
+func (t *cancelUpdatesTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	base := t.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	if strings.HasSuffix(req.URL.Path, "/getUpdates") {
+		reqCtx, cancel := context.WithCancel(req.Context())
+		defer cancel()
+		stopWatch := context.AfterFunc(t.pollCtx, cancel)
+		defer stopWatch()
+		req = req.Clone(reqCtx)
+	}
+	return base.RoundTrip(req)
 }
 
 type Bot struct {
@@ -45,12 +158,29 @@ type Bot struct {
 	rabbit        *broker.RabbitMQ
 	allowedUserID int64
 
-	mu        sync.RWMutex
-	proposals map[int]broker.Proposal
+	pollCancel  context.CancelFunc
+	pollerReady chan struct{}
+	stateMu     sync.Mutex
+	started     bool
+	stopped     bool
+	startDone   chan struct{}
+	stopOnce    sync.Once
+
+	mu           sync.RWMutex
+	proposals    map[int]broker.Proposal
+	actionStates map[int]actionState
 }
 
 func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
-	trimmedToken := strings.TrimSpace(token)
+	return newWithSettings(tele.Settings{
+		Token:       token,
+		Poller:      &tele.LongPoller{Timeout: 10 * time.Second},
+		Synchronous: true,
+	}, allowedUserID, rabbit)
+}
+
+func newWithSettings(pref tele.Settings, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
+	trimmedToken := strings.TrimSpace(pref.Token)
 	if trimmedToken == "" {
 		return nil, fmt.Errorf("telegram bot token must not be empty")
 	}
@@ -64,13 +194,50 @@ func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, erro
 		return nil, fmt.Errorf("rabbitmq broker must not be nil")
 	}
 
-	pref := tele.Settings{
-		Token:  trimmedToken,
-		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	ready := make(chan struct{})
+
+	innerPoller := pref.Poller
+	if innerPoller == nil {
+		innerPoller = &tele.LongPoller{Timeout: 10 * time.Second}
+	}
+	pref.Token = trimmedToken
+	pref.Synchronous = true
+	pref.Poller = &notifyPoller{inner: innerPoller, ready: ready}
+
+	if pref.Client == nil {
+		pref.Client = &http.Client{
+			Timeout:   time.Minute,
+			Transport: &cancelUpdatesTransport{pollCtx: pollCtx},
+		}
+	} else {
+		clientCopy := *pref.Client
+		clientCopy.Transport = &cancelUpdatesTransport{
+			base:    pref.Client.Transport,
+			pollCtx: pollCtx,
+		}
+		pref.Client = &clientCopy
+	}
+
+	if pref.OnError == nil {
+		pref.OnError = func(err error, c tele.Context) {
+			if err == nil {
+				return
+			}
+			attrs := []any{"error", err}
+			if c != nil {
+				attrs = append(attrs, "update_id", c.Update().ID)
+				if sender := c.Sender(); sender != nil {
+					attrs = append(attrs, "sender_id", sender.ID)
+				}
+			}
+			slog.Error("telebot handler error", attrs...)
+		}
 	}
 
 	b, err := tele.NewBot(pref)
 	if err != nil {
+		pollCancel()
 		return nil, fmt.Errorf("failed to create bot: %w", err)
 	}
 
@@ -78,47 +245,189 @@ func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, erro
 		tg:            b,
 		rabbit:        rabbit,
 		allowedUserID: allowedUserID,
+		pollCancel:    pollCancel,
+		pollerReady:   ready,
 		proposals:     make(map[int]broker.Proposal),
+		actionStates:  make(map[int]actionState),
 	}
 
 	instance.registerHandlers()
 	return instance, nil
 }
 
+func (b *Bot) StartAsync() <-chan struct{} {
+	b.stateMu.Lock()
+	if b.started || b.stopped {
+		done := b.startDone
+		b.stateMu.Unlock()
+		if done == nil {
+			closedCh := make(chan struct{})
+			close(closedCh)
+			return closedCh
+		}
+		return done
+	}
+	b.started = true
+	done := make(chan struct{})
+	b.startDone = done
+	b.stateMu.Unlock()
+
+	go func() {
+		defer close(done)
+		slog.Info("telegram bot started listening for events")
+		b.tg.Start()
+	}()
+	return done
+}
+
 func (b *Bot) Start() {
-	slog.Info("telegram bot started listening for events")
-	b.tg.Start()
+	<-b.StartAsync()
 }
 
 func (b *Bot) Stop() {
-	b.tg.Stop()
+	if b == nil {
+		return
+	}
+	b.stateMu.Lock()
+	b.stopped = true
+	started := b.started
+	done := b.startDone
+	b.stateMu.Unlock()
+
+	if b.pollCancel != nil {
+		b.pollCancel()
+	}
+	if !started {
+		return
+	}
+	<-b.pollerReady
+	b.stopOnce.Do(func() {
+		b.tg.Stop()
+	})
+	<-done
+}
+
+func formatProsSection(pros []string) (rawHTML string, renderedText string) {
+	if len(pros) == 0 {
+		return "", ""
+	}
+	var htmlBuf strings.Builder
+	var textBuf strings.Builder
+	count := 0
+	for _, rawPro := range pros {
+		clean := strings.TrimSpace(rawPro)
+		if clean == "" {
+			continue
+		}
+		item := truncateUTF16(clean, maxProItemRunes)
+		if count == 0 {
+			htmlBuf.WriteString("\n\n✅ <b>Плюси:</b>")
+			textBuf.WriteString("\n\n✅ Плюси:")
+		}
+		nextHTML := "\n• " + html.EscapeString(item)
+		nextText := "\n• " + item
+		if utf16Len(textBuf.String()+nextText) > maxProsTotalUTF16 {
+			break
+		}
+		htmlBuf.WriteString(nextHTML)
+		textBuf.WriteString(nextText)
+		count++
+		if count >= maxProsCount {
+			break
+		}
+	}
+	if count == 0 {
+		return "", ""
+	}
+	return htmlBuf.String(), textBuf.String()
 }
 
 func formatProposalHTML(p broker.Proposal) string {
-	title := html.EscapeString(truncateRunes(p.Title, maxTitleRunes))
-	summary := html.EscapeString(truncateRunes(p.Summary, maxSummaryRunes))
-	letter := html.EscapeString(truncateRunes(p.FinalLetter, maxLetterRunes))
+	title := truncateUTF16(p.Title, maxTitleRunes)
+	summary := truncateUTF16(p.Summary, maxSummaryRunes)
+	prosHTML, prosText := formatProsSection(p.Pros)
 
-	linkLine := ""
-	if isValidHTTPURL(p.Link) {
-		linkLine = fmt.Sprintf("\n🔗 <a href=\"%s\">Відкрити на Djinni</a>", html.EscapeString(strings.TrimSpace(p.Link)))
+	buildParts := func(t, s, pHTML, pText string, includeLink bool) (string, string, string) {
+		linkHTML := ""
+		linkText := ""
+		if includeLink && isValidHTTPURL(p.Link) {
+			escapedLink := html.EscapeString(strings.TrimSpace(p.Link))
+			linkHTML = fmt.Sprintf("\n🔗 <a href=\"%s\">Відкрити на Djinni</a>", escapedLink)
+			linkText = "\n🔗 Відкрити на Djinni"
+		}
+		prefixHTML := fmt.Sprintf(
+			"🚀 <b>%s</b>\n🎯 <b>Match Score:</b> %d/100\n📊 <b>Fluff Index:</b> %d%%%s\n\n💡 <b>Аналіз:</b> %s%s\n\n📝 <b>Готовий супровідний лист (тапни щоб скопіювати):</b>\n<code>",
+			html.EscapeString(t),
+			p.MatchScore,
+			p.FluffPercentage,
+			linkHTML,
+			html.EscapeString(s),
+			pHTML,
+		)
+		prefixText := fmt.Sprintf(
+			"🚀 %s\n🎯 Match Score: %d/100\n📊 Fluff Index: %d%%%s\n\n💡 Аналіз: %s%s\n\n📝 Готовий супровідний лист (тапни щоб скопіювати):\n",
+			t,
+			p.MatchScore,
+			p.FluffPercentage,
+			linkText,
+			s,
+			pText,
+		)
+		return prefixHTML, prefixText, "</code>"
 	}
 
-	return fmt.Sprintf(`🚀 <b>%s</b>
-🎯 <b>Match Score:</b> %d/100
-📊 <b>Fluff Index:</b> %d%%%s
+	includeLink := isValidHTTPURL(p.Link)
+	prefixHTML, prefixText, suffixHTML := buildParts(title, summary, prosHTML, prosText, includeLink)
+	if includeLink && (utf8.RuneCountInString(prefixHTML)+utf8.RuneCountInString(suffixHTML) > maxBaseRawRunes-200 ||
+		utf16Len(prefixText) > maxBaseUTF16-200) {
+		includeLink = false
+		prefixHTML, prefixText, suffixHTML = buildParts(title, summary, prosHTML, prosText, false)
+	}
 
-💡 <b>Аналіз:</b> %s
+	if utf8.RuneCountInString(prefixHTML)+utf8.RuneCountInString(suffixHTML) > maxBaseRawRunes-100 ||
+		utf16Len(prefixText) > maxBaseUTF16-100 {
+		prosHTML, prosText = "", ""
+		prefixHTML, prefixText, suffixHTML = buildParts(title, summary, "", "", includeLink)
+	}
 
-📝 <b>Готовий супровідний лист (тапни щоб скопіювати):</b>
-<code>%s</code>`,
-		title,
-		p.MatchScore,
-		p.FluffPercentage,
-		linkLine,
-		summary,
-		letter,
-	)
+	if overhead := utf8.RuneCountInString(prefixHTML) + utf8.RuneCountInString(suffixHTML); overhead > maxBaseRawRunes-100 {
+		excess := overhead - (maxBaseRawRunes - 100)
+		escSummaryRunes := utf8.RuneCountInString(html.EscapeString(summary))
+		if escSummaryRunes > excess {
+			summary = shrinkEscapedToRawBudget(summary, escSummaryRunes-excess)
+		} else {
+			summary = ""
+		}
+		prefixHTML, prefixText, suffixHTML = buildParts(title, summary, prosHTML, prosText, includeLink)
+		if overhead2 := utf8.RuneCountInString(prefixHTML) + utf8.RuneCountInString(suffixHTML); overhead2 > maxBaseRawRunes-50 {
+			excess2 := overhead2 - (maxBaseRawRunes - 50)
+			escTitleRunes := utf8.RuneCountInString(html.EscapeString(title))
+			if escTitleRunes > excess2 {
+				title = shrinkEscapedToRawBudget(title, escTitleRunes-excess2)
+			} else {
+				title = ""
+			}
+			prefixHTML, prefixText, suffixHTML = buildParts(title, summary, prosHTML, prosText, includeLink)
+		}
+	}
+
+	remUTF16 := maxBaseUTF16 - utf16Len(prefixText)
+	if remUTF16 > maxLetterRunes {
+		remUTF16 = maxLetterRunes
+	}
+	if remUTF16 < 0 {
+		remUTF16 = 0
+	}
+
+	remRaw := maxBaseRawRunes - utf8.RuneCountInString(prefixHTML) - utf8.RuneCountInString(suffixHTML)
+	if remRaw < 0 {
+		remRaw = 0
+	}
+
+	letter := truncateUTF16(p.FinalLetter, remUTF16)
+	letter = shrinkEscapedToRawBudget(letter, remRaw)
+
+	return prefixHTML + html.EscapeString(letter) + suffixHTML
 }
 
 func (b *Bot) getProposal(msgID int) (broker.Proposal, bool) {
@@ -147,6 +456,196 @@ func (b *Bot) saveProposal(msgID int, p broker.Proposal) {
 	b.proposals[msgID] = p
 }
 
+func (b *Bot) beginAction(msgID int) actionState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if state, ok := b.actionStates[msgID]; ok && state != actionIdle {
+		return state
+	}
+	if len(b.actionStates) >= maxActionStates {
+		oldestID := 0
+		first := true
+		for k, st := range b.actionStates {
+			if st == actionPending {
+				continue
+			}
+			if first || k < oldestID {
+				oldestID = k
+				first = false
+			}
+		}
+		if !first {
+			delete(b.actionStates, oldestID)
+		}
+	}
+	b.actionStates[msgID] = actionPending
+	return actionIdle
+}
+
+func (b *Bot) endAction(msgID int, next actionState) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if next == actionIdle {
+		delete(b.actionStates, msgID)
+		return
+	}
+	b.actionStates[msgID] = next
+}
+
+func entityTags(e tele.MessageEntity) (openTag, closeTag string, ok bool) {
+	switch e.Type {
+	case tele.EntityBold:
+		return "<b>", "</b>", true
+	case tele.EntityItalic:
+		return "<i>", "</i>", true
+	case tele.EntityUnderline:
+		return "<u>", "</u>", true
+	case tele.EntityStrikethrough:
+		return "<s>", "</s>", true
+	case tele.EntityCode:
+		return "<code>", "</code>", true
+	case tele.EntityCodeBlock:
+		if strings.TrimSpace(e.Language) != "" {
+			return fmt.Sprintf(`<pre><code class="language-%s">`, html.EscapeString(strings.TrimSpace(e.Language))), "</code></pre>", true
+		}
+		return "<pre>", "</pre>", true
+	case tele.EntitySpoiler:
+		return "<tg-spoiler>", "</tg-spoiler>", true
+	case tele.EntityTextLink:
+		if !isValidHTTPURL(e.URL) {
+			return "", "", false
+		}
+		return fmt.Sprintf(`<a href="%s">`, html.EscapeString(strings.TrimSpace(e.URL))), "</a>", true
+	default:
+		return "", "", false
+	}
+}
+
+type htmlEntitySpan struct {
+	start    int
+	end      int
+	openTag  string
+	closeTag string
+}
+
+func renderEntitiesHTML(units []uint16, cut int, appendedEllipsis bool, entities []tele.MessageEntity) string {
+	var spans []htmlEntitySpan
+	for _, e := range entities {
+		if e.Length <= 0 || e.Offset < 0 || e.Offset >= cut {
+			continue
+		}
+		openTag, closeTag, ok := entityTags(e)
+		if !ok {
+			continue
+		}
+		end := e.Offset + e.Length
+		if end > cut {
+			end = cut
+		}
+		if end <= e.Offset {
+			continue
+		}
+		spans = append(spans, htmlEntitySpan{
+			start:    e.Offset,
+			end:      end,
+			openTag:  openTag,
+			closeTag: closeTag,
+		})
+	}
+
+	sort.Slice(spans, func(i, j int) bool {
+		if spans[i].start != spans[j].start {
+			return spans[i].start < spans[j].start
+		}
+		return spans[i].end > spans[j].end
+	})
+
+	type openItem struct {
+		end      int
+		openTag  string
+		closeTag string
+	}
+
+	var out strings.Builder
+	var stack []openItem
+	pos := 0
+	spanIdx := 0
+
+	closeAt := func(targetPos int) {
+		for len(stack) > 0 && stack[len(stack)-1].end == targetPos {
+			top := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			out.WriteString(top.closeTag)
+		}
+		// Handle rare non-nested overlaps: if an inner span ended earlier than top
+		for i := len(stack) - 1; i >= 0; i-- {
+			if stack[i].end == targetPos {
+				var reopen []openItem
+				for j := len(stack) - 1; j >= i; j-- {
+					out.WriteString(stack[j].closeTag)
+					if j > i {
+						reopen = append(reopen, stack[j])
+					}
+				}
+				stack = stack[:i]
+				for k := len(reopen) - 1; k >= 0; k-- {
+					out.WriteString(reopen[k].openTag)
+					stack = append(stack, reopen[k])
+				}
+				break
+			}
+		}
+	}
+
+	nextEventPos := func() int {
+		next := cut
+		if spanIdx < len(spans) && spans[spanIdx].start < next {
+			next = spans[spanIdx].start
+		}
+		for _, item := range stack {
+			if item.end < next {
+				next = item.end
+			}
+		}
+		return next
+	}
+
+	for pos < cut || spanIdx < len(spans) || len(stack) > 0 {
+		closeAt(pos)
+		for spanIdx < len(spans) && spans[spanIdx].start == pos {
+			sp := spans[spanIdx]
+			spanIdx++
+			out.WriteString(sp.openTag)
+			stack = append(stack, openItem{end: sp.end, openTag: sp.openTag, closeTag: sp.closeTag})
+		}
+		if pos >= cut && len(stack) == 0 && spanIdx >= len(spans) {
+			break
+		}
+		next := nextEventPos()
+		if next > pos {
+			chunk := string(utf16.Decode(units[pos:next]))
+			out.WriteString(html.EscapeString(chunk))
+			pos = next
+		} else if len(stack) == 0 && spanIdx >= len(spans) {
+			break
+		}
+	}
+
+	if appendedEllipsis {
+		out.WriteRune('…')
+	}
+	return out.String()
+}
+
+func extractProposalLinkFromEntities(entities []tele.MessageEntity) string {
+	for _, e := range entities {
+		if e.Type == tele.EntityTextLink && isValidHTTPURL(e.URL) {
+			return strings.TrimSpace(e.URL)
+		}
+	}
+	return ""
+}
+
 func (b *Bot) renderBaseHTML(c tele.Context) (string, string) {
 	msg := c.Message()
 	if msg == nil {
@@ -160,8 +659,37 @@ func (b *Bot) renderBaseHTML(c tele.Context) (string, string) {
 	if len(lines) > 0 && strings.TrimSpace(lines[0]) != "" {
 		jobTitle = strings.TrimPrefix(lines[0], "🚀 ")
 	}
-	clean := strings.TrimSuffix(msg.Text, "\n\nВкажіть причину відхилення для навчання ШІ:")
-	return html.EscapeString(clean), jobTitle
+	clean := strings.TrimSuffix(msg.Text, rejectPromptText)
+	units := utf16.Encode([]rune(clean))
+	cut := len(units)
+	appendedEllipsis := false
+	if cut > maxBaseUTF16 {
+		cut = maxBaseUTF16 - 1
+		if cut > 0 && units[cut-1] >= 0xD800 && units[cut-1] <= 0xDBFF {
+			cut--
+		}
+		appendedEllipsis = true
+	}
+
+	rendered := renderEntitiesHTML(units, cut, appendedEllipsis, msg.Entities)
+	for utf8.RuneCountInString(rendered) > maxBaseRawRunes && cut > 0 {
+		excess := utf8.RuneCountInString(rendered) - maxBaseRawRunes
+		step := excess / 2
+		if step < 1 {
+			step = 1
+		}
+		if step > cut {
+			cut = 0
+		} else {
+			cut -= step
+			if cut > 0 && units[cut-1] >= 0xD800 && units[cut-1] <= 0xDBFF {
+				cut--
+			}
+		}
+		appendedEllipsis = true
+		rendered = renderEntitiesHTML(units, cut, appendedEllipsis, msg.Entities)
+	}
+	return rendered, jobTitle
 }
 
 func (b *Bot) registerHandlers() {
@@ -211,15 +739,49 @@ func (b *Bot) registerHandlers() {
 	btnReasonDomain := menu.Data("🏢 Нецікавий проєкт", "reason_domain")
 	btnCancel := menu.Data("🔙 Скасувати", "reason_cancel")
 
+	guardAction := func(c tele.Context) (int, bool) {
+		msg := c.Message()
+		if msg == nil {
+			return 0, false
+		}
+		switch b.beginAction(msg.ID) {
+		case actionPending:
+			_ = c.Respond(&tele.CallbackResponse{Text: "⏳ Запит уже обробляється..."})
+			return 0, false
+		case actionDone:
+			_ = c.Respond(&tele.CallbackResponse{Text: "✅ Дію вже виконано"})
+			return 0, false
+		default:
+			return msg.ID, true
+		}
+	}
+
 	b.tg.Handle(&btnApprove, func(c tele.Context) error {
+		msgID, ok := guardAction(c)
+		if !ok {
+			return nil
+		}
+
 		_ = c.Respond(&tele.CallbackResponse{Text: "✅ Схвалено! Відгук готовий до відправки."})
 
 		baseHTML, _ := b.renderBaseHTML(c)
 		updatedText := baseHTML + "\n\n────────────────\n<b>Статус:</b> ✅ <b>СХВАЛЕНО ТОБОЮ</b>"
-		return c.Edit(updatedText, tele.ModeHTML)
+		if err := c.Edit(updatedText, tele.ModeHTML); err != nil &&
+			!errors.Is(err, tele.ErrMessageNotModified) &&
+			!errors.Is(err, tele.ErrSameMessageContent) {
+			b.endAction(msgID, actionIdle)
+			return err
+		}
+		b.endAction(msgID, actionDone)
+		return nil
 	})
 
 	b.tg.Handle(&btnReject, func(c tele.Context) error {
+		msgID, ok := guardAction(c)
+		if !ok {
+			return nil
+		}
+
 		_ = c.Respond(&tele.CallbackResponse{Text: "Оберіть причину відхилення"})
 
 		reasonMenu := b.tg.NewMarkup()
@@ -231,24 +793,34 @@ func (b *Bot) registerHandlers() {
 		)
 
 		baseHTML, _ := b.renderBaseHTML(c)
-		return c.Edit(baseHTML+"\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", reasonMenu, tele.ModeHTML)
+		err := c.Edit(baseHTML+"\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", reasonMenu, tele.ModeHTML)
+		b.endAction(msgID, actionIdle)
+		return err
 	})
 
 	handleReasonChoice := func(c tele.Context, reasonText string) error {
+		msgID, ok := guardAction(c)
+		if !ok {
+			return nil
+		}
+
 		baseHTML, jobTitle := b.renderBaseHTML(c)
 
 		err := b.rabbit.SendFeedback(jobTitle, reasonText)
 		if err != nil {
+			b.endAction(msgID, actionIdle)
 			slog.Error("failed to publish feedback to rabbitmq", "error", err)
 			_ = c.Respond(&tele.CallbackResponse{Text: "⚠️ Помилка збереження фідбеку, спробуйте ще раз"})
 			return nil
 		}
 
+		// Mark done immediately after RabbitMQ publish succeeds so edit failure cannot trigger duplicate feedback.
+		b.endAction(msgID, actionDone)
+
 		slog.Info("feedback published to rabbitmq", "job", jobTitle, "reason", reasonText)
 		_ = c.Respond(&tele.CallbackResponse{Text: "Фідбек зафіксовано!"})
 
 		finalText := baseHTML + fmt.Sprintf("\n\n────────────────\n<b>Статус:</b> ❌ <b>ВІДХИЛЕНО</b> (Причина: <i>%s</i>)", html.EscapeString(reasonText))
-
 		return c.Edit(finalText, tele.ModeHTML)
 	}
 
@@ -265,24 +837,38 @@ func (b *Bot) registerHandlers() {
 	})
 
 	b.tg.Handle(&btnCancel, func(c tele.Context) error {
+		msgID, ok := guardAction(c)
+		if !ok {
+			return nil
+		}
+
 		_ = c.Respond(&tele.CallbackResponse{Text: "Дію скасовано"})
 
 		baseHTML, _ := b.renderBaseHTML(c)
 
 		revertMenu := b.tg.NewMarkup()
+		link := ""
 		if msg := c.Message(); msg != nil {
-			if p, ok := b.getProposal(msg.ID); ok && isValidHTTPURL(p.Link) {
-				revertMenu.Inline(
-					revertMenu.Row(btnApprove, btnReject),
-					revertMenu.Row(revertMenu.URL("↗️ Відкрити Djinni", strings.TrimSpace(p.Link))),
-				)
-				return c.Edit(baseHTML, revertMenu, tele.ModeHTML)
+			if p, found := b.getProposal(msg.ID); found && isValidHTTPURL(p.Link) {
+				link = strings.TrimSpace(p.Link)
+			} else {
+				link = extractProposalLinkFromEntities(msg.Entities)
 			}
 		}
-		revertMenu.Inline(
-			revertMenu.Row(btnApprove, btnReject),
-		)
-		return c.Edit(baseHTML, revertMenu, tele.ModeHTML)
+		if link != "" {
+			revertMenu.Inline(
+				revertMenu.Row(btnApprove, btnReject),
+				revertMenu.Row(revertMenu.URL("↗️ Відкрити Djinni", link)),
+			)
+		} else {
+			revertMenu.Inline(
+				revertMenu.Row(btnApprove, btnReject),
+			)
+		}
+
+		err := c.Edit(baseHTML, revertMenu, tele.ModeHTML)
+		b.endAction(msgID, actionIdle)
+		return err
 	})
 }
 
