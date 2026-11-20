@@ -1,5 +1,5 @@
 # Multi-stage build for Go Scraper
-FROM golang:alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 ENV GOTOOLCHAIN=auto
 

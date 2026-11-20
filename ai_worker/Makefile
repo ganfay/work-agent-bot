@@ -7,6 +7,7 @@ help:
 	@echo "Available commands in AI Worker:"
 	@echo "  make run        - Start the AI Worker service (auto-indexes vectors if empty)"
 	@echo "  make index      - Manually re-generate and index code embeddings into pgvector"
+	@echo "  make test       - Run all Python unit tests"
 	@echo "  make install    - Install python dependencies from requirements.txt"
 	@echo "  make clean      - Remove __pycache__ and temporary Python files"
 
@@ -17,6 +18,10 @@ run:
 .PHONY: index
 index:
 	$(PYTHON) rag/indexer.py
+
+.PHONY: test
+test:
+	$(PYTHON) -m unittest discover -s tests -v
 
 .PHONY: install
 install:

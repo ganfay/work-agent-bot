@@ -4,14 +4,16 @@ export
 
 PG_HOST ?= localhost
 PG_PORT ?= 5432
-DB_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB)?sslmode=disable
-MIGRATE_BIN := go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+PG_SSLMODE ?= disable
+DB_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB)?sslmode=$(PG_SSLMODE)
+MIGRATE_BIN := go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.2
 
 .PHONY: help
 help:
 	@echo "Available commands in Scraper:"
 	@echo "  make run             - Run the scraper daemon"
 	@echo "  make build           - Build executable binary to bin/scraper"
+	@echo "  make test            - Run unit tests with race detector"
 	@echo "  make tidy            - Run go mod tidy to clean up dependencies"
 	@echo "  make vet             - Run go vet static analysis"
 	@echo "  make migrate-create  - Create a new migration pair in migrations/"
@@ -27,6 +29,10 @@ run:
 build:
 	@mkdir -p bin
 	go build -o bin/scraper main.go
+
+.PHONY: test
+test:
+	go test -v -race ./...
 
 .PHONY: tidy
 tidy:

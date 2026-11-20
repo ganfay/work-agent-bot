@@ -1,5 +1,5 @@
 # Multi-stage build for Go Telegram Bot
-FROM golang:alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 ENV GOTOOLCHAIN=auto
 

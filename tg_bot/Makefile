@@ -7,6 +7,7 @@ help:
 	@echo "Available commands in TG Bot:"
 	@echo "  make run        - Run the Telegram Bot service"
 	@echo "  make build      - Build binary to bin/tg_bot"
+	@echo "  make test       - Run unit tests with race detector"
 	@echo "  make tidy       - Run go mod tidy"
 	@echo "  make vet        - Run go vet static analysis"
 	@echo "  make clean      - Remove build artifacts and logs"
@@ -19,6 +20,10 @@ run:
 build:
 	@mkdir -p bin
 	go build -o bin/tg_bot main.go
+
+.PHONY: test
+test:
+	go test -v -race ./...
 
 .PHONY: tidy
 tidy:
