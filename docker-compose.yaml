@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: ${PG_PASSWORD}
       POSTGRES_DB: ${PG_DB}
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
@@ -28,8 +28,8 @@ services:
       RABBITMQ_DEFAULT_PASS: ${RMQ_PASS}
       RABBITMQ_NODENAME: rabbit@rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
     healthcheck:
@@ -44,11 +44,20 @@ services:
       dockerfile: Dockerfile
     container_name: bidder_scraper
     restart: ${RESTART_POLICY:-unless-stopped}
-    env_file:
-      - .env
     environment:
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
       PG_HOST: db
+      PG_PORT: ${PG_PORT:-5432}
+      PG_SSLMODE: ${PG_SSLMODE:-disable}
+      RMQ_USER: ${RMQ_USER}
+      RMQ_PASS: ${RMQ_PASS}
       RMQ_HOST: rabbitmq
+      RMQ_PORT: ${RMQ_PORT:-5672}
+      DJINNI_RSS_URL: ${DJINNI_RSS_URL}
+      LOG_PATH: ${LOG_PATH:-logs/scraper.log}
+      SCRAPE_INTERVAL: ${SCRAPE_INTERVAL:-15m}
       RUN_ONCE: ${RUN_ONCE:-false}
     depends_on:
       db:
@@ -62,11 +71,21 @@ services:
       dockerfile: Dockerfile
     container_name: bidder_ai_worker
     restart: ${RESTART_POLICY:-unless-stopped}
-    env_file:
-      - .env
     environment:
+      PG_USER: ${PG_USER}
+      PG_PASSWORD: ${PG_PASSWORD}
+      PG_DB: ${PG_DB}
       PG_HOST: db
+      PG_PORT: ${PG_PORT:-5432}
+      RMQ_USER: ${RMQ_USER}
+      RMQ_PASS: ${RMQ_PASS}
       RMQ_HOST: rabbitmq
+      RMQ_PORT: ${RMQ_PORT:-5672}
+      GEMINI_API_KEY: ${GEMINI_API_KEY}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-3.5-flash-lite}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      AI_LOG_PATH: ${AI_LOG_PATH:-logs/ai_worker.log}
+      AI_BATCH_IDLE_TIMEOUT: ${AI_BATCH_IDLE_TIMEOUT:-20s}
       RUN_ONCE: ${RUN_ONCE:-false}
     volumes:
       - ./candidate_profile.json:/app/candidate_profile.json:ro
@@ -82,10 +101,16 @@ services:
       dockerfile: Dockerfile
     container_name: bidder_tg_bot
     restart: ${RESTART_POLICY:-unless-stopped}
-    env_file:
-      - .env
     environment:
+      RMQ_USER: ${RMQ_USER}
+      RMQ_PASS: ${RMQ_PASS}
       RMQ_HOST: rabbitmq
+      RMQ_PORT: ${RMQ_PORT:-5672}
+      TG_BOT_TOKEN: ${TG_BOT_TOKEN}
+      TG_USER_ID: ${TG_USER_ID}
+      TG_LOG_PATH: ${TG_LOG_PATH:-logs/tg_bot.log}
+      TG_BATCH_IDLE_TIMEOUT: ${TG_BATCH_IDLE_TIMEOUT:-90s}
+      TG_POLL_GRACE: ${TG_POLL_GRACE:-15s}
       RUN_ONCE: ${RUN_ONCE:-false}
     depends_on:
       rabbitmq:
