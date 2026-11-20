@@ -2,6 +2,8 @@ package djinni
 
 import (
 	"log/slog"
+	"net/http"
+	"time"
 
 	"github.com/mmcdole/gofeed"
 )
@@ -18,6 +20,7 @@ type Job struct {
 // FetchJobs downloads and parses the RSS feed into a slice of Jobs
 func FetchJobs(rssURL string) ([]Job, error) {
 	fp := gofeed.NewParser()
+	fp.Client = &http.Client{Timeout: 15 * time.Second}
 	feed, err := fp.ParseURL(rssURL)
 	if err != nil {
 		return nil, err

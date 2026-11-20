@@ -33,7 +33,7 @@ func main() {
 	}
 	defer rmq.Close()
 
-	telegramBot, err := bot.New(cfg.Telegram.BotToken, rmq)
+	telegramBot, err := bot.New(cfg.Telegram.BotToken, cfg.Telegram.UserID, rmq)
 	if err != nil {
 		slog.Error("failed to initialize telegram bot", "error", err)
 		os.Exit(1)
@@ -42,7 +42,6 @@ func main() {
 	go telegramBot.Start()
 	defer telegramBot.Stop()
 
-	// 6. Отримуємо Go-канал із черги review_queue
 	msgs, err := rmq.ConsumeProposals()
 	if err != nil {
 		slog.Error("failed to start consuming review_queue", "error", err)

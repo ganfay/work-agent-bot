@@ -5,6 +5,7 @@ import (
 	"html"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"tg_bot/internal/broker"
@@ -13,11 +14,15 @@ import (
 )
 
 type Bot struct {
-	tg     *tele.Bot
-	rabbit *broker.RabbitMQ
+	tg            *tele.Bot
+	rabbit        *broker.RabbitMQ
+	allowedUserID int64
+
+	mu        sync.RWMutex
+	proposals map[int]broker.Proposal
 }
 
-func New(token string, rabbit *broker.RabbitMQ) (*Bot, error) {
+func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
 	pref := tele.Settings{
 		Token:  token,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
@@ -29,8 +34,10 @@ func New(token string, rabbit *broker.RabbitMQ) (*Bot, error) {
 	}
 
 	instance := &Bot{
-		tg:     b,
-		rabbit: rabbit,
+		tg:            b,
+		rabbit:        rabbit,
+		allowedUserID: allowedUserID,
+		proposals:     make(map[int]broker.Proposal),
 	}
 
 	instance.registerHandlers()
@@ -46,7 +53,68 @@ func (b *Bot) Stop() {
 	b.tg.Stop()
 }
 
+func formatProposalHTML(p broker.Proposal) string {
+	return fmt.Sprintf(`🚀 <b>%s</b>
+🎯 <b>Match Score:</b> %d/100
+📊 <b>Fluff Index:</b> %d%%
+🔗 <a href="%s">Відкрити на Djinni</a>
+
+💡 <b>Аналіз:</b> %s
+
+📝 <b>Готовий супровідний лист (тапни щоб скопіювати):</b>
+<code>%s</code>`,
+		html.EscapeString(p.Title),
+		p.MatchScore,
+		p.FluffPercentage,
+		html.EscapeString(p.Link),
+		html.EscapeString(p.Summary),
+		html.EscapeString(p.FinalLetter),
+	)
+}
+
+func (b *Bot) getProposal(msgID int) (broker.Proposal, bool) {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	p, ok := b.proposals[msgID]
+	return p, ok
+}
+
+func (b *Bot) saveProposal(msgID int, p broker.Proposal) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.proposals) >= 500 {
+		for k := range b.proposals {
+			delete(b.proposals, k)
+			break
+		}
+	}
+	b.proposals[msgID] = p
+}
+
+func (b *Bot) renderBaseHTML(c tele.Context) (string, string) {
+	if p, ok := b.getProposal(c.Message().ID); ok {
+		return formatProposalHTML(p), p.Title
+	}
+	lines := strings.Split(c.Message().Text, "\n")
+	jobTitle := "Unknown Job"
+	if len(lines) > 0 {
+		jobTitle = strings.TrimPrefix(lines[0], "🚀 ")
+	}
+	clean := strings.TrimSuffix(c.Message().Text, "\n\nВкажіть причину відхилення для навчання ШІ:")
+	return html.EscapeString(clean), jobTitle
+}
+
 func (b *Bot) registerHandlers() {
+	b.tg.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
+		return func(c tele.Context) error {
+			if b.allowedUserID != 0 && (c.Sender() == nil || c.Sender().ID != b.allowedUserID) {
+				slog.Warn("blocked unauthorized telegram access", "sender", c.Sender())
+				return nil
+			}
+			return next(c)
+		}
+	})
+
 	// 1. Команда /start
 	b.tg.Handle("/start", func(c tele.Context) error {
 		msg := `🤖 <b>AI Job Hunter Bot онлайн!</b>
@@ -69,7 +137,8 @@ func (b *Bot) registerHandlers() {
 	b.tg.Handle(&btnApprove, func(c tele.Context) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "✅ Схвалено! Відгук готовий до відправки."})
 
-		updatedText := c.Message().Text + "\n\n────────────────\n<b>Статус:</b> ✅ <b>СХВАЛЕНО ТОБОЮ</b>"
+		baseHTML, _ := b.renderBaseHTML(c)
+		updatedText := baseHTML + "\n\n────────────────\n<b>Статус:</b> ✅ <b>СХВАЛЕНО ТОБОЮ</b>"
 		return c.Edit(updatedText, tele.ModeHTML)
 	})
 
@@ -84,17 +153,14 @@ func (b *Bot) registerHandlers() {
 			reasonMenu.Row(btnCancel),
 		)
 
-		return c.Edit(c.Message().Text+"\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", reasonMenu, tele.ModeHTML)
+		baseHTML, _ := b.renderBaseHTML(c)
+		return c.Edit(baseHTML+"\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", reasonMenu, tele.ModeHTML)
 	})
 
 	handleReasonChoice := func(c tele.Context, reasonText string) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "Фідбек зафіксовано!"})
 
-		lines := strings.Split(c.Message().Text, "\n")
-		jobTitle := "Unknown Job"
-		if len(lines) > 0 {
-			jobTitle = strings.TrimPrefix(lines[0], "🚀 ")
-		}
+		baseHTML, jobTitle := b.renderBaseHTML(c)
 
 		err := b.rabbit.SendFeedback(jobTitle, reasonText)
 		if err != nil {
@@ -103,8 +169,7 @@ func (b *Bot) registerHandlers() {
 			slog.Info("feedback published to rabbitmq", "job", jobTitle, "reason", reasonText)
 		}
 
-		cleanText := strings.Replace(c.Message().Text, "\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", "", 1)
-		finalText := cleanText + fmt.Sprintf("\n\n────────────────\n<b>Статус:</b> ❌ <b>ВІДХИЛЕНО</b> (Причина: <i>%s</i>)", reasonText)
+		finalText := baseHTML + fmt.Sprintf("\n\n────────────────\n<b>Статус:</b> ❌ <b>ВІДХИЛЕНО</b> (Причина: <i>%s</i>)", html.EscapeString(reasonText))
 
 		return c.Edit(finalText, tele.ModeHTML)
 	}
@@ -124,33 +189,25 @@ func (b *Bot) registerHandlers() {
 	b.tg.Handle(&btnCancel, func(c tele.Context) error {
 		_ = c.Respond(&tele.CallbackResponse{Text: "Дію скасовано"})
 
-		baseText := strings.Replace(c.Message().Text, "\n\n<i>Вкажіть причину відхилення для навчання ШІ:</i>", "", 1)
+		baseHTML, _ := b.renderBaseHTML(c)
 
 		revertMenu := b.tg.NewMarkup()
-		revertMenu.Inline(
-			revertMenu.Row(btnApprove, btnReject),
-		)
-		return c.Edit(baseText, revertMenu, tele.ModeHTML)
+		if p, ok := b.getProposal(c.Message().ID); ok && p.Link != "" {
+			revertMenu.Inline(
+				revertMenu.Row(btnApprove, btnReject),
+				revertMenu.Row(revertMenu.URL("↗️ Відкрити Djinni", p.Link)),
+			)
+		} else {
+			revertMenu.Inline(
+				revertMenu.Row(btnApprove, btnReject),
+			)
+		}
+		return c.Edit(baseHTML, revertMenu, tele.ModeHTML)
 	})
 }
 
 func (b *Bot) SendVacancy(userID int64, p broker.Proposal) error {
-	text := fmt.Sprintf(`🚀 <b>%s</b>
-🎯 <b>Match Score:</b> %d/100
-📊 <b>Fluff Index:</b> %d%%
-🔗 <a href="%s">Відкрити на Djinni</a>
-
-💡 <b>Аналіз:</b> %s
-
-📝 <b>Готовий супровідний лист (тапни щоб скопіювати):</b>
-<code>%s</code>`,
-		html.EscapeString(p.Title),
-		p.MatchScore,
-		p.FluffPercentage,
-		p.Link,
-		html.EscapeString(p.Summary),
-		html.EscapeString(p.FinalLetter),
-	)
+	text := formatProposalHTML(p)
 
 	menu := b.tg.NewMarkup()
 	btnApprove := menu.Data("✅ Схвалити", "btn_approve")
@@ -163,6 +220,12 @@ func (b *Bot) SendVacancy(userID int64, p broker.Proposal) error {
 	)
 
 	targetChat := tele.ChatID(userID)
-	_, err := b.tg.Send(targetChat, text, menu, tele.ModeHTML)
-	return err
+	sent, err := b.tg.Send(targetChat, text, menu, tele.ModeHTML)
+	if err != nil {
+		return err
+	}
+	if sent != nil {
+		b.saveProposal(sent.ID, p)
+	}
+	return nil
 }

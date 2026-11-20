@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -22,8 +23,10 @@ type Proposal struct {
 }
 
 type RabbitMQ struct {
-	conn *amqp.Connection
-	ch   *amqp.Channel
+	conn      *amqp.Connection
+	consumeCh *amqp.Channel
+	publishCh *amqp.Channel
+	pubMu     sync.Mutex
 }
 
 func NewRabbitMQ(url string) (*RabbitMQ, error) {
@@ -32,14 +35,27 @@ func NewRabbitMQ(url string) (*RabbitMQ, error) {
 		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", err)
 	}
 
-	ch, err := conn.Channel()
+	consumeCh, err := conn.Channel()
 	if err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("failed to open channel: %w", err)
+		return nil, fmt.Errorf("failed to open consume channel: %w", err)
+	}
+
+	publishCh, err := conn.Channel()
+	if err != nil {
+		_ = consumeCh.Close()
+		_ = conn.Close()
+		return nil, fmt.Errorf("failed to open publish channel: %w", err)
+	}
+
+	closeAll := func() {
+		_ = publishCh.Close()
+		_ = consumeCh.Close()
+		_ = conn.Close()
 	}
 
 	// review_queue (звідки бот читає готові тексти)
-	_, err = ch.QueueDeclare(
+	_, err = consumeCh.QueueDeclare(
 		"review_queue",
 		true,
 		false,
@@ -48,10 +64,11 @@ func NewRabbitMQ(url string) (*RabbitMQ, error) {
 		nil,
 	)
 	if err != nil {
+		closeAll()
 		return nil, fmt.Errorf("failed to declare review_queue: %w", err)
 	}
 
-	_, err = ch.QueueDeclare(
+	_, err = publishCh.QueueDeclare(
 		"feedback_queue",
 		true,
 		false,
@@ -60,17 +77,25 @@ func NewRabbitMQ(url string) (*RabbitMQ, error) {
 		nil,
 	)
 	if err != nil {
+		closeAll()
 		return nil, fmt.Errorf("failed to declare feedback_queue: %w", err)
 	}
 
-	_ = ch.Qos(1, 0, false)
+	if err := consumeCh.Qos(1, 0, false); err != nil {
+		closeAll()
+		return nil, fmt.Errorf("failed to set qos on consume channel: %w", err)
+	}
 
 	slog.Info("connected to rabbitmq successfully")
-	return &RabbitMQ{conn: conn, ch: ch}, nil
+	return &RabbitMQ{
+		conn:      conn,
+		consumeCh: consumeCh,
+		publishCh: publishCh,
+	}, nil
 }
 
 func (r *RabbitMQ) ConsumeProposals() (<-chan amqp.Delivery, error) {
-	msgs, err := r.ch.Consume(
+	msgs, err := r.consumeCh.Consume(
 		"review_queue",
 		"",
 		false, // manual ACK
@@ -97,8 +122,18 @@ func (r *RabbitMQ) SendFeedback(jobTitle, reason string) error {
 		return err
 	}
 
-	return r.ch.PublishWithContext(
-		context.Background(),
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	r.pubMu.Lock()
+	defer r.pubMu.Unlock()
+
+	if r.publishCh == nil {
+		return fmt.Errorf("publish channel is closed")
+	}
+
+	return r.publishCh.PublishWithContext(
+		ctx,
 		"",               // exchange
 		"feedback_queue", // routing key
 		false,
@@ -112,8 +147,15 @@ func (r *RabbitMQ) SendFeedback(jobTitle, reason string) error {
 }
 
 func (r *RabbitMQ) Close() {
-	if r.ch != nil {
-		_ = r.ch.Close()
+	r.pubMu.Lock()
+	if r.publishCh != nil {
+		_ = r.publishCh.Close()
+		r.publishCh = nil
+	}
+	r.pubMu.Unlock()
+
+	if r.consumeCh != nil {
+		_ = r.consumeCh.Close()
 	}
 	if r.conn != nil {
 		_ = r.conn.Close()

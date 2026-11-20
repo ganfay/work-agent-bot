@@ -2,10 +2,13 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"scraper/internal/djinni"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -14,12 +17,16 @@ type JobRepository struct {
 }
 
 func NewJobRepository(dsn string) (*JobRepository, error) {
-	pool, err := pgxpool.New(context.Background(), dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to db: %w", err)
 	}
 
-	if err := pool.Ping(context.Background()); err != nil {
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("failed to ping db: %w", err)
 	}
 
@@ -43,7 +50,7 @@ func (r *JobRepository) SaveJobIfNotExists(ctx context.Context, job djinni.Job) 
 	var id int
 	err := r.pool.QueryRow(ctx, query, job.GUID, job.Title, job.Description).Scan(&id)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
+		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}
 		return false, fmt.Errorf("failed to insert job: %w", err)

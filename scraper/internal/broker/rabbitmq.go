@@ -24,6 +24,7 @@ func NewRabbitMQ(url string) (*RabbitMQ, error) {
 
 	ch, err := conn.Channel()
 	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("failed to open channel: %w", err)
 	}
 
@@ -32,8 +33,12 @@ func NewRabbitMQ(url string) (*RabbitMQ, error) {
 }
 
 func (r *RabbitMQ) Close() {
-	r.ch.Close()
-	r.conn.Close()
+	if r.ch != nil {
+		_ = r.ch.Close()
+	}
+	if r.conn != nil {
+		_ = r.conn.Close()
+	}
 }
 
 func (r *RabbitMQ) DeclareQueue(name string) (amqp.Queue, error) {
