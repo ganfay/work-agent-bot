@@ -17,7 +17,11 @@ import (
 
 func main() {
 	// 1. Initialize configuration
-	cfg := config.LoadConfig("../.env")
+	cfg, err := config.LoadConfig("../.env")
+	if err != nil {
+		slog.Error("failed to load configuration", "error", err)
+		os.Exit(1)
+	}
 
 	// 2. Initialize structured logging with file rotation (slog + lumberjack)
 	logger.Setup(cfg.Scraper.LogPath)

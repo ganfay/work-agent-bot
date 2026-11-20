@@ -1,10 +1,12 @@
 package config
 
 import (
-	"log/slog"
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
@@ -17,6 +19,7 @@ type Config struct {
 		Host     string `env:"PG_HOST" env-default:"localhost"`
 		Port     string `env:"PG_PORT" env-default:"5432"`
 		Name     string `env:"PG_DB" env-required:"true"`
+		SSLMode  string `env:"PG_SSLMODE" env-default:"disable"`
 	}
 	RabbitMQ struct {
 		User     string `env:"RMQ_USER" env-required:"true"`
@@ -34,12 +37,19 @@ type Config struct {
 
 // DSN builds the PostgreSQL connection string with properly URL-encoded credentials.
 func (c *Config) DSN() string {
+	sslMode := strings.TrimSpace(c.Database.SSLMode)
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	q := url.Values{}
+	q.Set("sslmode", sslMode)
+
 	u := &url.URL{
 		Scheme:   "postgres",
 		User:     url.UserPassword(c.Database.User, c.Database.Password),
 		Host:     net.JoinHostPort(c.Database.Host, c.Database.Port),
 		Path:     "/" + c.Database.Name,
-		RawQuery: "sslmode=disable",
+		RawQuery: q.Encode(),
 	}
 	return u.String()
 }
@@ -55,32 +65,74 @@ func (c *Config) URL() string {
 	return u.String()
 }
 
-// LoadConfig parses the .env file or reads directly from environment variables
-func LoadConfig(envPath string) *Config {
-	var cfg Config
-	var err error
+// Validate normalizes and validates configuration values after loading.
+func (c *Config) Validate() error {
+	rssURL := strings.TrimSpace(c.Scraper.RSSURL)
+	if rssURL == "" {
+		return errors.New("DJINNI_RSS_URL must not be empty")
+	}
+	parsed, err := url.Parse(rssURL)
+	if err != nil {
+		return fmt.Errorf("invalid DJINNI_RSS_URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("invalid DJINNI_RSS_URL scheme %q: must be http or https", parsed.Scheme)
+	}
+	if parsed.Host == "" || parsed.Hostname() == "" {
+		return errors.New("invalid DJINNI_RSS_URL: host must not be empty")
+	}
+	c.Scraper.RSSURL = rssURL
 
-	// 1. Try provided path if exists
+	if strings.TrimSpace(c.Database.SSLMode) == "" {
+		c.Database.SSLMode = "disable"
+	}
+	return nil
+}
+
+// LoadConfig parses the .env file or reads directly from environment variables.
+func LoadConfig(envPath string) (*Config, error) {
+	var cfg Config
+
+	// 1. Try provided path if it exists
 	if envPath != "" {
-		if _, statErr := os.Stat(envPath); statErr == nil {
-			if err = cleanenv.ReadConfig(envPath, &cfg); err == nil {
-				return &cfg
+		_, statErr := os.Stat(envPath)
+		if statErr == nil {
+			if err := cleanenv.ReadConfig(envPath, &cfg); err != nil {
+				return nil, fmt.Errorf("load config %q: %w", envPath, err)
 			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return &cfg, nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat config %q: %w", envPath, statErr)
 		}
 	}
 
-	// 2. Try current directory .env if exists
-	if _, statErr := os.Stat(".env"); statErr == nil {
-		if err = cleanenv.ReadConfig(".env", &cfg); err == nil {
-			return &cfg
+	// 2. Try current directory .env if it exists
+	if envPath != ".env" {
+		_, statErr := os.Stat(".env")
+		if statErr == nil {
+			if err := cleanenv.ReadConfig(".env", &cfg); err != nil {
+				return nil, fmt.Errorf("load config \".env\": %w", err)
+			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return &cfg, nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat config \".env\": %w", statErr)
 		}
 	}
 
 	// 3. Fallback to process environment variables (standard in Docker / Prod)
-	err = cleanenv.ReadEnv(&cfg)
-	if err != nil {
-		slog.Error("failed to load configuration", "error", err)
-		os.Exit(1)
+	if err := cleanenv.ReadEnv(&cfg); err != nil {
+		return nil, fmt.Errorf("load env config: %w", err)
 	}
-	return &cfg
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }

@@ -17,13 +17,19 @@ func setRequiredScraperEnv(t *testing.T) {
 func TestLoadConfig_RunOnceDefaultAndOverride(t *testing.T) {
 	setRequiredScraperEnv(t)
 
-	cfg := LoadConfig("/nonexistent/.env")
+	cfg, err := LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
 	if cfg.Scraper.RunOnce {
 		t.Fatalf("expected RunOnce default false, got true")
 	}
 
 	t.Setenv("RUN_ONCE", "true")
-	cfg = LoadConfig("/nonexistent/.env")
+	cfg, err = LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
 	if !cfg.Scraper.RunOnce {
 		t.Fatalf("expected RunOnce true when RUN_ONCE=true")
 	}
@@ -34,7 +40,10 @@ func TestConfig_URLEncodesSpecialCharactersInCredentials(t *testing.T) {
 	t.Setenv("PG_PASSWORD", "p@ss:word/1#2")
 	t.Setenv("RMQ_PASS", "r@mq:pass/3")
 
-	cfg := LoadConfig("/nonexistent/.env")
+	cfg, err := LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("LoadConfig failed: %v", err)
+	}
 	wantDSN := "postgres://u:p%40ss%3Aword%2F1%232@localhost:5432/db?sslmode=disable"
 	if got := cfg.DSN(); got != wantDSN {
 		t.Fatalf("unexpected DSN:\n got: %s\nwant: %s", got, wantDSN)
