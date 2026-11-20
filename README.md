@@ -14,13 +14,13 @@ flowchart LR
     TG -->|feedback_queue| Worker
 ```
 
-1. **`scraper` (Go):** Polls `DJINNI_RSS_URL`, deduplicates jobs in PostgreSQL (`jobs`), and publishes new ones to `new_vacancies`.
-2. **`ai_worker` (Python):** Runs a 4-step `gemini-3.5-flash-lite` pipeline:
+1. **`scraper` (Go):** Polls `DJINNI_RSS_URL`, deduplicates jobs in PostgreSQL (`jobs`), and publishes new ones to `new_vacancies` with RabbitMQ publisher confirms (and compensating DB rollback on publish failure).
+2. **`ai_worker` (Python):** Runs a 4-step Gemini (`GEMINI_MODEL`, default `gemini-3.5-flash-lite`) pipeline:
    - **Analyzer:** Scores the vacancy (0–100) using recent rejections from `user_feedback`, or skips it (`SKIP`).
-   - **Validator:** Queries `code_embeddings` (`pgvector` HNSW, `gemini-embedding-001`) to match required skills against `candidate_profile.json`.
+   - **Validator:** Queries `code_embeddings` (`pgvector` HNSW, `GEMINI_EMBEDDING_MODEL`, default `gemini-embedding-001`) to match required skills against `candidate_profile.json`.
    - **Drafter & Critic:** Generates a short cover letter from verified facts and strips generic AI phrasing.
-   - Publishes the result to `review_queue`. On startup, if `code_embeddings` is empty, it runs `index_knowledge_base()` automatically.
-3. **`tg_bot` (Go):** Sends proposals to your Telegram chat with **Approve** / **Reject** buttons. Rejections are published to `feedback_queue` and saved in PostgreSQL for future runs.
+   - Publishes the result to `review_queue` (or routes unrecoverable messages to `*.dlq` dead-letter queues). On startup, if `code_embeddings` is empty, it runs `index_knowledge_base()` automatically.
+3. **`tg_bot` (Go):** Sends proposals to your Telegram chat with **Approve** / **Reject** buttons (enforcing fail-closed `TG_USER_ID` auth, callback double-tap protection, and `429 FloodError` retry). Rejections are published to `feedback_queue` and saved in PostgreSQL for future runs.
 
 ## Stack
 
@@ -36,7 +36,8 @@ flowchart LR
    cd work-agent-bot
    cp .env.example .env
    ```
-   Fill in `PG_PASSWORD`, `GEMINI_API_KEY`, `TG_BOT_TOKEN`, `TG_USER_ID`, and `DJINNI_RSS_URL` in `.env`.
+   Fill in `PG_PASSWORD`, `RMQ_USER`, `RMQ_PASS`, `GEMINI_API_KEY`, `TG_BOT_TOKEN`, `TG_USER_ID`, and `DJINNI_RSS_URL` in `.env`.
+   *(Note: In `docker-compose.yaml`, PostgreSQL `5432` and RabbitMQ `5672`/`15672` are bound to `127.0.0.1` only, and `init.sql` initializes the schema automatically on first start).*
 
 2. Update `candidate_profile.json` with your background and project snippets.
 
@@ -57,10 +58,12 @@ flowchart LR
 make run-once       # Run one full batch cycle and tear down containers
 make up             # Build and start all services in background
 make down           # Stop all containers
+make restart        # Restart all containers
 make ps             # Check container status
 make logs           # Tail all service logs (or logs-scraper / logs-ai / logs-bot)
-make migrate-up     # Run PostgreSQL migrations
-make index          # Re-index candidate_profile.json into pgvector
+make test           # Run all Go (-race) and Python unit tests
+make migrate-up     # Run PostgreSQL migrations (or migrate-down)
+make index          # Re-index candidate_profile.json into pgvector (or index-docker)
 make clean          # Stop containers, remove volumes, and clear Python caches
 ```
 
