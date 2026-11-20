@@ -7,7 +7,20 @@ import random
 import time
 from typing import Callable, TypeVar
 
+from google import genai
+from google.genai import types
+
 logger = logging.getLogger("ai_worker")
+
+DEFAULT_GEMINI_TIMEOUT_MS = 30_000
+
+
+def create_genai_client(api_key: str, timeout_ms: int = DEFAULT_GEMINI_TIMEOUT_MS) -> genai.Client:
+    """Creates a google-genai Client configured with an explicit HTTP timeout (in ms)."""
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_ms),
+    )
 
 T = TypeVar("T")
 

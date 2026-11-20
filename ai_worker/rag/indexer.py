@@ -35,7 +35,7 @@ def index_knowledge_base():
         logger.info(f"[{i}/{len(chunks)}] Embedded: {chunk['project']} - {chunk['category']}")
 
     logger.info("Connecting to PostgreSQL to atomically replace codebase embeddings...")
-    conn = psycopg2.connect(settings.database_url())
+    conn = psycopg2.connect(**settings.pg_connect_kwargs(statement_timeout_ms=30000))
     try:
         register_vector(conn)
         with conn:

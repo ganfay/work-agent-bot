@@ -1,3 +1,4 @@
+import re
 import signal
 import sys
 import psycopg2
@@ -9,11 +10,19 @@ from broker.feedback_consumer import (
     get_recent_feedback_reasons,
 )
 from config.config import settings
+from core.llm import create_genai_client
 from core.logger import setup_logger
+from core.sanitize import (
+    MAX_DESCRIPTION_LEN,
+    MAX_TITLE_LEN,
+    redact_url,
+    sanitize_text,
+)
 from agents.analyzer import VacancyAnalyzer
 from agents.validator import EvidenceValidator
 from agents.drafter import CoverLetterDrafter
 from agents.critic import CoverLetterCritic
+from rag.embedder import embedder
 from rag.indexer import index_knowledge_base
 
 # 1. Initialize logger
@@ -23,7 +32,7 @@ logger = setup_logger(settings.log_path)
 def ensure_embeddings_exist():
     conn = None
     try:
-        conn = psycopg2.connect(settings.database_url())
+        conn = psycopg2.connect(**settings.pg_connect_kwargs(statement_timeout_ms=30000))
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -59,6 +68,7 @@ def ensure_embeddings_exist():
         if conn is not None:
             conn.close()
 
+genai_client = None
 analyzer = None
 validator = None
 drafter = None
@@ -66,22 +76,50 @@ critic = None
 
 
 def init_agents():
-    global analyzer, validator, drafter, critic
+    global genai_client, analyzer, validator, drafter, critic
     if not settings.gemini_api_key:
         logger.critical("GEMINI_API_KEY is not set in .env! Exiting.")
         sys.exit(1)
 
-    analyzer = VacancyAnalyzer(api_key=settings.gemini_api_key)
-    validator = EvidenceValidator(api_key=settings.gemini_api_key)
-    drafter = CoverLetterDrafter(api_key=settings.gemini_api_key)
-    critic = CoverLetterCritic(api_key=settings.gemini_api_key)
+    genai_client = create_genai_client(settings.gemini_api_key)
+    embedder.set_client(genai_client)
+    analyzer = VacancyAnalyzer(api_key=settings.gemini_api_key, client=genai_client)
+    validator = EvidenceValidator(api_key=settings.gemini_api_key, client=genai_client)
+    drafter = CoverLetterDrafter(api_key=settings.gemini_api_key, client=genai_client)
+    critic = CoverLetterCritic(api_key=settings.gemini_api_key, client=genai_client)
+
+
+def close_agents():
+    global genai_client, analyzer, validator, drafter, critic
+    for agent in (analyzer, validator, drafter, critic):
+        if agent is not None and hasattr(agent, "close"):
+            try:
+                agent.close()
+            except Exception:
+                pass
+    try:
+        embedder.set_client(None)
+        embedder.close()
+    except Exception:
+        pass
+    if genai_client is not None:
+        try:
+            genai_client.close()
+        except Exception:
+            pass
+        finally:
+            genai_client = None
+    analyzer = None
+    validator = None
+    drafter = None
+    critic = None
 
 
 # 5. Vacancy processing handler
 def process_vacancy(job: dict, publisher_func):
-    title = job.get("Title", "No Title")
-    link = job.get("Link", "")
-    description = job.get("Description", "")
+    title = sanitize_text(job.get("Title") or "No Title", MAX_TITLE_LEN, single_line=True) or "No Title"
+    link = re.sub(r"[\x00-\x1f\x7f]+", "", str(job.get("Link") or "")).strip()
+    description = sanitize_text(job.get("Description") or "", MAX_DESCRIPTION_LEN)
 
     logger.info("==================================================")
     logger.info(f"Incoming job from queue: '{title}'")
@@ -155,8 +193,8 @@ def main():
     ensure_embeddings_exist()
 
     consumer = RabbitMQConsumer(
-        amqp_url=settings.rabbitmq_url(),
-        queue_name=settings.queue_name
+        queue_name=settings.queue_name,
+        connection_params=settings.rmq_connection_parameters(),
     )
 
     def _handle_sigterm(signum, frame):
@@ -187,9 +225,12 @@ def main():
         sys.exit(0)
 
     except Exception as err:
-        logger.critical(f"Fatal worker error: {err}", exc_info=True)
+        logger.critical(f"Fatal worker error: {redact_url(err)}", exc_info=True)
         consumer.close()
         sys.exit(1)
+
+    finally:
+        close_agents()
 
 
 if __name__ == "__main__":

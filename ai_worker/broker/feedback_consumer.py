@@ -12,6 +12,7 @@ import psycopg2
 import pika
 
 from config.config import settings
+from core.sanitize import redact_url
 
 logger = logging.getLogger("ai_worker")
 
@@ -20,7 +21,7 @@ def get_recent_feedback_reasons(limit: int = 5) -> list[str]:
     """Вибирає останні унікальні причини відхилень із PostgreSQL для пам'яті ШІ."""
     conn = None
     try:
-        conn = psycopg2.connect(settings.database_url())
+        conn = psycopg2.connect(**settings.pg_connect_kwargs())
         with conn.cursor() as cur:
             cur.execute(
                 """
@@ -35,16 +36,21 @@ def get_recent_feedback_reasons(limit: int = 5) -> list[str]:
             rows = cur.fetchall()
         return [r[0] for r in rows if r[0]]
     except Exception as err:
-        logger.error(f"[FeedbackEngine] Failed to read feedback memory: {err}")
+        logger.error(f"[FeedbackEngine] Failed to read feedback memory: {redact_url(err)}")
         return []
     finally:
         if conn is not None:
             conn.close()
 
 
-def _persist_feedback(pg_url: str, job_title: str, reason: str, conn=None):
+def _persist_feedback(pg_url: str | None, job_title: str, reason: str, conn=None):
     owned_conn = conn is None
-    db_conn = conn if conn is not None else psycopg2.connect(pg_url)
+    if conn is not None:
+        db_conn = conn
+    elif pg_url:
+        db_conn = psycopg2.connect(pg_url, connect_timeout=10, options="-c statement_timeout=15000")
+    else:
+        db_conn = psycopg2.connect(**settings.pg_connect_kwargs())
     cur = db_conn.cursor()
     try:
         cur.execute(
@@ -74,9 +80,7 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
         while stop_event is None or not stop_event.is_set():
             connection = None
             try:
-                params = pika.URLParameters(settings.rabbitmq_url())
-                params.heartbeat = 600
-                params.blocked_connection_timeout = 300
+                params = settings.rmq_connection_parameters()
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.queue_declare(queue="feedback_queue", durable=True)
@@ -99,11 +103,11 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
 
                     try:
                         logger.info(f"[FeedbackEngine] Captured human rejection for '{job_title}': '{reason}'")
-                        _persist_feedback(settings.database_url(), job_title, reason)
+                        _persist_feedback(None, job_title, reason)
                         ch.basic_ack(delivery_tag=method.delivery_tag)
                         logger.info("[FeedbackEngine] Stored feedback in PostgreSQL successfully.")
                     except Exception as e:
-                        logger.error(f"[FeedbackEngine] Error storing feedback in PostgreSQL: {e}")
+                        logger.error(f"[FeedbackEngine] Error storing feedback in PostgreSQL: {redact_url(e)}")
                         requeue = not method.redelivered
                         ch.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue)
 
@@ -114,7 +118,7 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                 if stop_event is not None and stop_event.is_set():
                     break
                 logger.error(
-                    f"[FeedbackEngine] Feedback listener disconnected: {e}. Reconnecting in {backoff:.1f}s..."
+                    f"[FeedbackEngine] Feedback listener disconnected: {redact_url(e)}. Reconnecting in {backoff:.1f}s..."
                 )
                 time.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
@@ -132,15 +136,16 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
 
 def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None) -> int:
     """Synchronously drains all pending messages from feedback_queue into PostgreSQL."""
-    rmq_url = amqp_url or settings.rabbitmq_url()
-    pg_url = db_url or settings.database_url()
     processed = 0
     connection = None
     pg_conn = None
     try:
-        params = pika.URLParameters(rmq_url)
-        params.heartbeat = 600
-        params.blocked_connection_timeout = 300
+        if amqp_url:
+            params = pika.URLParameters(amqp_url)
+            params.heartbeat = 600
+            params.blocked_connection_timeout = 300
+        else:
+            params = settings.rmq_connection_parameters()
         connection = pika.BlockingConnection(params)
         channel = connection.channel()
         channel.queue_declare(queue="feedback_queue", durable=True)
@@ -157,18 +162,21 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
                 reason = str(data.get("reason", "No reason"))
 
                 if pg_conn is None or getattr(pg_conn, "closed", 0):
-                    pg_conn = psycopg2.connect(pg_url)
+                    if db_url:
+                        pg_conn = psycopg2.connect(db_url, connect_timeout=10, options="-c statement_timeout=15000")
+                    else:
+                        pg_conn = psycopg2.connect(**settings.pg_connect_kwargs())
 
-                _persist_feedback(pg_url, job_title, reason, conn=pg_conn)
+                _persist_feedback(db_url, job_title, reason, conn=pg_conn)
 
                 channel.basic_ack(delivery_tag=method_frame.delivery_tag)
                 processed += 1
                 logger.info(f"[FeedbackEngine] Drained feedback for '{job_title}': '{reason}'")
             except Exception as e:
-                logger.error(f"[FeedbackEngine] Error draining feedback message: {e}")
+                logger.error(f"[FeedbackEngine] Error draining feedback message: {redact_url(e)}")
                 channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
     except Exception as e:
-        logger.error(f"[FeedbackEngine] Failed to drain feedback_queue: {e}")
+        logger.error(f"[FeedbackEngine] Failed to drain feedback_queue: {redact_url(e)}")
     finally:
         if pg_conn is not None:
             try:

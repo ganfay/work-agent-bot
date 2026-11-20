@@ -34,7 +34,7 @@ class VectorRetriever:
         ]
 
     def search_evidence(self, query: str, limit: int = 2, threshold: float = 0.50) -> List[Dict[str, Any]]:
-        conn = psycopg2.connect(settings.database_url())
+        conn = psycopg2.connect(**settings.pg_connect_kwargs())
         try:
             register_vector(conn)
             with conn.cursor() as cursor:
@@ -48,7 +48,7 @@ class VectorRetriever:
         """Searches pgvector for multiple technologies while reusing a single PostgreSQL connection."""
         if not queries:
             return {}
-        conn = psycopg2.connect(settings.database_url())
+        conn = psycopg2.connect(**settings.pg_connect_kwargs())
         try:
             register_vector(conn)
             results: Dict[str, List[Dict[str, Any]]] = {}

@@ -7,16 +7,26 @@ logger = logging.getLogger("ai_worker")
 
 
 class RabbitMQConsumer:
-    def __init__(self, amqp_url: str, queue_name: str):
+    def __init__(
+        self,
+        amqp_url: str | None = None,
+        queue_name: str = "new_vacancies",
+        *,
+        connection_params=None,
+    ):
         self.amqp_url = amqp_url
         self.queue_name = queue_name
+        self._connection_params = connection_params
         self.connection = None
         self.channel = None
 
     def connect(self):
-        params = pika.URLParameters(self.amqp_url)
-        params.heartbeat = 600
-        params.blocked_connection_timeout = 300
+        if self._connection_params is not None:
+            params = self._connection_params
+        else:
+            params = pika.URLParameters(self.amqp_url)
+            params.heartbeat = 600
+            params.blocked_connection_timeout = 300
         self.connection = pika.BlockingConnection(params)
         self.channel = self.connection.channel()
 

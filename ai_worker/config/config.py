@@ -85,5 +85,68 @@ class Config:
         password = quote(self.db_password, safe="")
         return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
+    def pg_connect_kwargs(self, connect_timeout: int = 10, statement_timeout_ms: int = 15000) -> dict:
+        port = int(self.db_port) if str(self.db_port).isdigit() else self.db_port
+        return {
+            "host": self.db_host,
+            "port": port,
+            "dbname": self.db_name,
+            "user": self.db_user,
+            "password": self.db_password,
+            "connect_timeout": connect_timeout,
+            "options": f"-c statement_timeout={statement_timeout_ms}",
+        }
+
+    def rmq_connection_kwargs(
+        self,
+        heartbeat: int = 600,
+        blocked_connection_timeout: int = 300,
+        connection_attempts: int = 3,
+        retry_delay: float = 2.0,
+        socket_timeout: float = 10.0,
+    ) -> dict:
+        port = int(self.rmq_port) if str(self.rmq_port).isdigit() else self.rmq_port
+        return {
+            "host": self.rmq_host,
+            "port": port,
+            "virtual_host": "/",
+            "username": self.rmq_user,
+            "password": self.rmq_pass,
+            "heartbeat": heartbeat,
+            "blocked_connection_timeout": blocked_connection_timeout,
+            "connection_attempts": connection_attempts,
+            "retry_delay": retry_delay,
+            "socket_timeout": socket_timeout,
+        }
+
+    def rmq_connection_parameters(
+        self,
+        heartbeat: int = 600,
+        blocked_connection_timeout: int = 300,
+        connection_attempts: int = 3,
+        retry_delay: float = 2.0,
+        socket_timeout: float = 10.0,
+    ):
+        import pika
+
+        kw = self.rmq_connection_kwargs(
+            heartbeat=heartbeat,
+            blocked_connection_timeout=blocked_connection_timeout,
+            connection_attempts=connection_attempts,
+            retry_delay=retry_delay,
+            socket_timeout=socket_timeout,
+        )
+        return pika.ConnectionParameters(
+            host=kw["host"],
+            port=kw["port"],
+            virtual_host=kw["virtual_host"],
+            credentials=pika.PlainCredentials(kw["username"], kw["password"]),
+            heartbeat=kw["heartbeat"],
+            blocked_connection_timeout=kw["blocked_connection_timeout"],
+            connection_attempts=kw["connection_attempts"],
+            retry_delay=kw["retry_delay"],
+            socket_timeout=kw["socket_timeout"],
+        )
+
 
 settings = Config()
