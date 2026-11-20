@@ -96,7 +96,9 @@ func TestRun_RunOncePublishesNewJobsAndEOF(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	run(ctx, cfg, repo, pub, "new_vacancies", fetcher)
+	if err := run(ctx, cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("run returned unexpected error: %v", err)
+	}
 
 	if fetchCalls != 1 {
 		t.Fatalf("expected 1 fetch call, got %d", fetchCalls)
@@ -121,7 +123,9 @@ func TestRun_RunOnceEmptyFeedStillPublishesEOF(t *testing.T) {
 		return nil, nil
 	}
 
-	run(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if err := run(context.Background(), cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("run returned unexpected error: %v", err)
+	}
 
 	if len(pub.published) != 0 {
 		t.Fatalf("expected 0 published jobs, got %d", len(pub.published))
@@ -140,7 +144,9 @@ func TestRun_RunOnceFetchErrorStillPublishesEOF(t *testing.T) {
 		return nil, errors.New("network timeout")
 	}
 
-	run(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if err := run(context.Background(), cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("run returned unexpected error: %v", err)
+	}
 
 	if len(pub.eofQueues) != 1 {
 		t.Fatalf("expected batch EOF even on fetch error, got %+v", pub.eofQueues)
@@ -165,7 +171,9 @@ func TestRun_DaemonModeRunsUntilContextCancelledWithoutEOF(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
 	defer cancel()
 
-	run(ctx, cfg, repo, pub, "new_vacancies", fetcher)
+	if err := run(ctx, cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("run returned unexpected error: %v", err)
+	}
 
 	mu.Lock()
 	calls := fetchCalls
@@ -191,14 +199,18 @@ func TestRunScrapeIteration_SkipsDBErrorAndCancelledContext(t *testing.T) {
 		}, nil
 	}
 
-	runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if err := runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("runScrapeIteration returned unexpected error: %v", err)
+	}
 	if len(pub.published) != 1 || pub.published[0].GUID != "good-1" {
 		t.Fatalf("expected only good-1 published, got %+v", pub.published)
 	}
 
 	cancelledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
-	runScrapeIteration(cancelledCtx, cfg, repo, pub, "new_vacancies", fetcher)
+	if err := runScrapeIteration(cancelledCtx, cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("runScrapeIteration returned unexpected error: %v", err)
+	}
 	if len(pub.published) != 1 {
 		t.Fatalf("expected no additional publishes on cancelled ctx, got %+v", pub.published)
 	}
@@ -213,7 +225,9 @@ func TestRunScrapeIteration_RollsBackDBRecordOnPublishFailure(t *testing.T) {
 		return []djinni.Job{{GUID: "retry-1", Title: "Go Dev"}}, nil
 	}
 
-	runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if err := runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("runScrapeIteration returned unexpected error: %v", err)
+	}
 
 	if len(repo.deleted) != 1 || repo.deleted[0] != "retry-1" {
 		t.Fatalf("expected rollback delete for retry-1, got %+v", repo.deleted)
@@ -224,7 +238,9 @@ func TestRunScrapeIteration_RollsBackDBRecordOnPublishFailure(t *testing.T) {
 
 	// Next cycle after RabbitMQ recovers should publish retry-1
 	pub.pubErr = nil
-	runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if err := runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher); err != nil {
+		t.Fatalf("runScrapeIteration returned unexpected error: %v", err)
+	}
 	if len(pub.published) != 1 || pub.published[0].GUID != "retry-1" {
 		t.Fatalf("expected retry-1 to be published after recovery, got %+v", pub.published)
 	}
