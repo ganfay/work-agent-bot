@@ -50,3 +50,7 @@ logs/
 *.swp
 *.swo
 .DS_Store
+
+# Agent metadata
+.agents/
+
