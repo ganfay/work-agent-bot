@@ -61,6 +61,39 @@ func makeDelivery(ack amqp.Acknowledger, tag uint64, body []byte) amqp.Delivery 
 	}
 }
 
+func instantSleep(_ context.Context, _ time.Duration) error {
+	return nil
+}
+
+func fastTestRetryConfig() sendRetryConfig {
+	return sendRetryConfig{
+		maxAttempts:    3,
+		initialBackoff: time.Millisecond,
+		maxBackoff:     5 * time.Millisecond,
+		sleep:          instantSleep,
+	}
+}
+
+type fakeDLQ struct {
+	mu      sync.Mutex
+	bodies  [][]byte
+	reasons []string
+	err     error
+}
+
+func (f *fakeDLQ) PublishReviewDLQ(_ context.Context, rawBody []byte, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return f.err
+	}
+	cp := make([]byte, len(rawBody))
+	copy(cp, rawBody)
+	f.bodies = append(f.bodies, cp)
+	f.reasons = append(f.reasons, reason)
+	return nil
+}
+
 func TestRunConsumerLoop_RunOnceProcessesAndStopsOnEOF(t *testing.T) {
 	ack := &fakeAck{}
 	sender := &fakeSender{}
@@ -73,7 +106,7 @@ func TestRunConsumerLoop_RunOnceProcessesAndStopsOnEOF(t *testing.T) {
 	msgs <- makeDelivery(ack, 2, eofBytes)
 
 	start := time.Now()
-	runConsumerLoop(context.Background(), msgs, sender, 42, true, 5*time.Second, 25*time.Millisecond)
+	runConsumerLoop(context.Background(), msgs, sender, nil, 42, true, 5*time.Second, 25*time.Millisecond, fastTestRetryConfig())
 	elapsed := time.Since(start)
 
 	if len(sender.sent) != 1 || sender.sent[0].Title != "Go Engineer" {
@@ -92,7 +125,7 @@ func TestRunConsumerLoop_RunOnceIdleTimeout(t *testing.T) {
 	msgs := make(chan amqp.Delivery)
 
 	start := time.Now()
-	runConsumerLoop(context.Background(), msgs, sender, 42, true, 30*time.Millisecond, 10*time.Millisecond)
+	runConsumerLoop(context.Background(), msgs, sender, nil, 42, true, 30*time.Millisecond, 10*time.Millisecond, fastTestRetryConfig())
 	elapsed := time.Since(start)
 
 	if elapsed < 35*time.Millisecond {
@@ -103,6 +136,7 @@ func TestRunConsumerLoop_RunOnceIdleTimeout(t *testing.T) {
 func TestRunConsumerLoop_HandlesBadJSONAndSendError(t *testing.T) {
 	ack := &fakeAck{}
 	sender := &fakeSender{err: errors.New("telegram 429")}
+	dlq := &fakeDLQ{}
 	msgs := make(chan amqp.Delivery, 4)
 
 	pBytes, _ := json.Marshal(broker.Proposal{Title: "Go Engineer", MatchScore: 88})
@@ -112,19 +146,16 @@ func TestRunConsumerLoop_HandlesBadJSONAndSendError(t *testing.T) {
 	msgs <- makeDelivery(ack, 11, pBytes)
 	msgs <- makeDelivery(ack, 12, eofBytes)
 
-	runConsumerLoop(context.Background(), msgs, sender, 42, true, time.Second, 0)
+	runConsumerLoop(context.Background(), msgs, sender, dlq, 42, true, time.Second, 0, fastTestRetryConfig())
 
-	if len(ack.nacks) != 2 {
-		t.Fatalf("expected 2 nacks, got %+v", ack.nacks)
+	if len(dlq.bodies) != 2 {
+		t.Fatalf("expected 2 DLQ entries (bad JSON + exhausted send error), got %d", len(dlq.bodies))
 	}
-	if ack.requeue[0] != false {
-		t.Fatalf("expected bad JSON nack requeue=false")
+	if len(ack.nacks) != 0 {
+		t.Fatalf("expected 0 nacks when DLQ succeeds, got %+v", ack.nacks)
 	}
-	if ack.requeue[1] != false {
-		t.Fatalf("expected send error nack requeue=false in runOnce mode")
-	}
-	if len(ack.acks) != 1 || ack.acks[0] != 12 {
-		t.Fatalf("expected EOF ack [12], got %+v", ack.acks)
+	if len(ack.acks) != 3 || ack.acks[0] != 10 || ack.acks[1] != 11 || ack.acks[2] != 12 {
+		t.Fatalf("expected acks [10, 11, 12], got %+v", ack.acks)
 	}
 }
 
@@ -140,7 +171,7 @@ func TestRunConsumerLoop_DaemonModeIgnoresEOFAndExitsOnCancel(t *testing.T) {
 	defer cancel()
 
 	start := time.Now()
-	runConsumerLoop(ctx, msgs, sender, 42, false, 5*time.Millisecond, 100*time.Millisecond)
+	runConsumerLoop(ctx, msgs, sender, nil, 42, false, 5*time.Millisecond, 100*time.Millisecond, fastTestRetryConfig())
 	elapsed := time.Since(start)
 
 	if elapsed < 35*time.Millisecond {
@@ -156,7 +187,7 @@ func TestRunConsumerLoop_DaemonModeReturnsErrorOnBrokerDisconnect(t *testing.T) 
 	msgs := make(chan amqp.Delivery)
 	close(msgs)
 
-	err := runConsumerLoop(context.Background(), msgs, sender, 42, false, time.Second, 0)
+	err := runConsumerLoop(context.Background(), msgs, sender, nil, 42, false, time.Second, 0, fastTestRetryConfig())
 	if !errors.Is(err, errBrokerChannelClosed) {
 		t.Fatalf("expected errBrokerChannelClosed on unexpected close in daemon mode, got %v", err)
 	}
