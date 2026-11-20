@@ -2,12 +2,19 @@ package djinni
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/mmcdole/gofeed"
+)
+
+const (
+	defaultUserAgent = "work-agent-bot-scraper/1.0"
+	maxFeedBodyBytes = 10 << 20 // 10 MiB
+	fetchTimeout     = 15 * time.Second
 )
 
 // Job represents a clean, parsed vacancy from Djinni.
@@ -21,14 +28,17 @@ type Job struct {
 
 // FetchJobs downloads and parses the RSS feed into a slice of Jobs.
 func FetchJobs(ctx context.Context, rssURL string) ([]Job, error) {
-	fetchCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 
 	fp := gofeed.NewParser()
-	fp.Client = &http.Client{Timeout: 15 * time.Second}
+	fp.UserAgent = defaultUserAgent
+	fp.MaxByteSize = maxFeedBodyBytes
+	fp.Client = &http.Client{Timeout: fetchTimeout}
+
 	feed, err := fp.ParseURLWithContext(rssURL, fetchCtx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("fetch rss feed: %w", err)
 	}
 
 	jobs := make([]Job, 0, len(feed.Items))

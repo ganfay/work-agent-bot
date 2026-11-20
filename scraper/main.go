@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -24,7 +25,16 @@ func main() {
 	}
 
 	// 2. Initialize structured logging with file rotation (slog + lumberjack)
-	logger.Setup(cfg.Scraper.LogPath)
+	_, logCloser, err := logger.Setup(cfg.Scraper.LogPath)
+	if err != nil {
+		slog.Error("failed to initialize logger", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if err := logCloser.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to close logger: %v\n", err)
+		}
+	}()
 	slog.Info("starting scraper daemon")
 
 	// 3. Graceful shutdown setup via signal.NotifyContext
