@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -29,17 +30,72 @@ type pgxPool interface {
 
 type poolOpener func(ctx context.Context, dsn string) (pgxPool, error)
 
+var pgPasswordKVPattern = regexp.MustCompile(`(?i)\bpassword\s*=\s*(?:'(?:\\.|[^'])*'|"(?:\\.|[^"])*"|\S+)`)
+
+type sanitizedError struct {
+	msg   string
+	cause error
+}
+
+func (e *sanitizedError) Error() string {
+	return e.msg
+}
+
+func (e *sanitizedError) Unwrap() error {
+	return e.cause
+}
+
+func redactDSN(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	if schemeIdx := strings.Index(dsn, "://"); schemeIdx >= 0 {
+		prefix := dsn[:schemeIdx+3]
+		rest := dsn[schemeIdx+3:]
+		authEnd := len(rest)
+		for _, sep := range []string{"/", "?", "#"} {
+			if idx := strings.Index(rest, sep); idx >= 0 && idx < authEnd {
+				authEnd = idx
+			}
+		}
+		authority := rest[:authEnd]
+		suffix := rest[authEnd:]
+		if atIdx := strings.LastIndex(authority, "@"); atIdx >= 0 {
+			return prefix + "xxxxx:xxxxx@" + authority[atIdx+1:] + suffix
+		}
+	}
+	return pgPasswordKVPattern.ReplaceAllString(dsn, "password=xxxxx")
+}
+
+func sanitizePGError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var parseErr *pgconn.ParseConfigError
+	if errors.As(err, &parseErr) {
+		parseErr.ConnString = redactDSN(parseErr.ConnString)
+		msg := err.Error()
+		if redacted := redactDSN(msg); redacted != msg {
+			return &sanitizedError{
+				msg:   redacted,
+				cause: parseErr.Unwrap(),
+			}
+		}
+	}
+	return err
+}
+
 func defaultOpenPool(ctx context.Context, dsn string) (pgxPool, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, err
+		return nil, sanitizePGError(err)
 	}
 	if cfg.ConnConfig.ConnectTimeout <= 0 {
 		cfg.ConnConfig.ConnectTimeout = defaultConnectTimeout
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, err
+		return nil, sanitizePGError(err)
 	}
 	return pool, nil
 }
