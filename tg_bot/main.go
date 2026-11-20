@@ -68,11 +68,7 @@ func defaultAppDeps() appDeps {
 			return broker.NewRabbitMQ(url)
 		},
 		newBot: func(token string, allowedUserID int64, rabbit appBroker) (appBot, error) {
-			rmq, ok := rabbit.(*broker.RabbitMQ)
-			if !ok || rmq == nil {
-				return nil, errors.New("invalid rabbitmq broker instance")
-			}
-			return bot.New(token, allowedUserID, rmq)
+			return bot.New(token, allowedUserID, rabbit)
 		},
 		retryCfg: defaultRetryConfig(),
 	}

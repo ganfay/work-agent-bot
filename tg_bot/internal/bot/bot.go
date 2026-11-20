@@ -153,9 +153,14 @@ func (t *cancelUpdatesTransport) RoundTrip(req *http.Request) (*http.Response, e
 	return base.RoundTrip(req)
 }
 
+// FeedbackPublisher publishes user rejection feedback for AI training.
+type FeedbackPublisher interface {
+	SendFeedback(jobTitle, reason string) error
+}
+
 type Bot struct {
 	tg            *tele.Bot
-	rabbit        *broker.RabbitMQ
+	publisher     FeedbackPublisher
 	allowedUserID int64
 
 	pollCancel  context.CancelFunc
@@ -171,15 +176,15 @@ type Bot struct {
 	actionStates map[int]actionState
 }
 
-func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
+func New(token string, allowedUserID int64, publisher FeedbackPublisher) (*Bot, error) {
 	return newWithSettings(tele.Settings{
 		Token:       token,
 		Poller:      &tele.LongPoller{Timeout: 10 * time.Second},
 		Synchronous: true,
-	}, allowedUserID, rabbit)
+	}, allowedUserID, publisher)
 }
 
-func newWithSettings(pref tele.Settings, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
+func newWithSettings(pref tele.Settings, allowedUserID int64, publisher FeedbackPublisher) (*Bot, error) {
 	trimmedToken := strings.TrimSpace(pref.Token)
 	if trimmedToken == "" {
 		return nil, fmt.Errorf("telegram bot token must not be empty")
@@ -190,8 +195,8 @@ func newWithSettings(pref tele.Settings, allowedUserID int64, rabbit *broker.Rab
 	if allowedUserID <= 0 {
 		return nil, fmt.Errorf("allowed user ID must be positive, got %d", allowedUserID)
 	}
-	if rabbit == nil {
-		return nil, fmt.Errorf("rabbitmq broker must not be nil")
+	if publisher == nil {
+		return nil, fmt.Errorf("feedback publisher must not be nil")
 	}
 
 	pollCtx, pollCancel := context.WithCancel(context.Background())
@@ -243,7 +248,7 @@ func newWithSettings(pref tele.Settings, allowedUserID int64, rabbit *broker.Rab
 
 	instance := &Bot{
 		tg:            b,
-		rabbit:        rabbit,
+		publisher:     publisher,
 		allowedUserID: allowedUserID,
 		pollCancel:    pollCancel,
 		pollerReady:   ready,
@@ -806,7 +811,7 @@ func (b *Bot) registerHandlers() {
 
 		baseHTML, jobTitle := b.renderBaseHTML(c)
 
-		err := b.rabbit.SendFeedback(jobTitle, reasonText)
+		err := b.publisher.SendFeedback(jobTitle, reasonText)
 		if err != nil {
 			b.endAction(msgID, actionIdle)
 			slog.Error("failed to publish feedback to rabbitmq", "error", err)
