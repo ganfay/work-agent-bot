@@ -1,10 +1,13 @@
 package config
 
 import (
-	"log/slog"
+	"errors"
+	"fmt"
 	"net"
 	"net/url"
 	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ilyakaznacheev/cleanenv"
@@ -48,34 +51,119 @@ func (c *Config) normalize() {
 	}
 }
 
-func LoadConfig(envPath string) *Config {
+func validateHost(envName, raw string) (string, error) {
+	host := strings.TrimSpace(raw)
+	if host == "" {
+		return "", fmt.Errorf("%s must not be empty", envName)
+	}
+	if strings.ContainsAny(host, " \t\r\n@/?#") {
+		return "", fmt.Errorf("invalid %s %q: must not contain whitespace or @/?#", envName, raw)
+	}
+	return host, nil
+}
+
+func validatePort(envName, raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", fmt.Errorf("%s must not be empty", envName)
+	}
+	if strings.HasPrefix(trimmed, "+") {
+		return "", fmt.Errorf("invalid %s %q: must be an integer between 1 and 65535", envName, raw)
+	}
+	port, err := strconv.Atoi(trimmed)
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("invalid %s %q: must be an integer between 1 and 65535", envName, raw)
+	}
+	return strconv.Itoa(port), nil
+}
+
+// Validate normalizes and validates configuration values after loading.
+func (c *Config) Validate() error {
+	token := strings.TrimSpace(c.Telegram.BotToken)
+	if token == "" {
+		return errors.New("TG_BOT_TOKEN must not be empty")
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		return errors.New("invalid TG_BOT_TOKEN: must not contain whitespace")
+	}
+	c.Telegram.BotToken = token
+
+	if c.Telegram.UserID <= 0 {
+		return errors.New("TG_USER_ID must be a positive integer")
+	}
+
+	if strings.TrimSpace(c.RabbitMQ.User) == "" {
+		return errors.New("RMQ_USER must not be empty")
+	}
+	if c.RabbitMQ.Password == "" {
+		return errors.New("RMQ_PASS must not be empty")
+	}
+
+	rmqHost, err := validateHost("RMQ_HOST", c.RabbitMQ.Host)
+	if err != nil {
+		return err
+	}
+	c.RabbitMQ.Host = rmqHost
+
+	rmqPort, err := validatePort("RMQ_PORT", c.RabbitMQ.Port)
+	if err != nil {
+		return err
+	}
+	c.RabbitMQ.Port = rmqPort
+
+	logPath := strings.TrimSpace(c.Bot.LogPath)
+	if logPath == "" {
+		return errors.New("TG_LOG_PATH must not be empty")
+	}
+	c.Bot.LogPath = logPath
+
+	c.normalize()
+	return nil
+}
+
+func LoadConfig(envPath string) (*Config, error) {
 	var cfg Config
-	var err error
 
 	// 1. Try provided path if exists
 	if envPath != "" {
-		if _, statErr := os.Stat(envPath); statErr == nil {
-			if err = cleanenv.ReadConfig(envPath, &cfg); err == nil {
-				cfg.normalize()
-				return &cfg
+		_, statErr := os.Stat(envPath)
+		if statErr == nil {
+			if err := cleanenv.ReadConfig(envPath, &cfg); err != nil {
+				return nil, fmt.Errorf("load config %q: %w", envPath, err)
 			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return &cfg, nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat config %q: %w", envPath, statErr)
 		}
 	}
 
 	// 2. Try current directory .env if exists
-	if _, statErr := os.Stat(".env"); statErr == nil {
-		if err = cleanenv.ReadConfig(".env", &cfg); err == nil {
-			cfg.normalize()
-			return &cfg
+	if envPath != ".env" {
+		_, statErr := os.Stat(".env")
+		if statErr == nil {
+			if err := cleanenv.ReadConfig(".env", &cfg); err != nil {
+				return nil, fmt.Errorf("load config \".env\": %w", err)
+			}
+			if err := cfg.Validate(); err != nil {
+				return nil, err
+			}
+			return &cfg, nil
+		}
+		if !errors.Is(statErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("stat config \".env\": %w", statErr)
 		}
 	}
 
 	// 3. Fallback to process environment variables (standard in Docker / Prod)
-	err = cleanenv.ReadEnv(&cfg)
-	if err != nil {
-		slog.Error("failed to load bot configuration", "error", err)
-		os.Exit(1)
+	if err := cleanenv.ReadEnv(&cfg); err != nil {
+		return nil, fmt.Errorf("load env config: %w", err)
 	}
-	cfg.normalize()
-	return &cfg
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return &cfg, nil
 }

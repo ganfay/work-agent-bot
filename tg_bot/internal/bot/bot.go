@@ -50,8 +50,22 @@ type Bot struct {
 }
 
 func New(token string, allowedUserID int64, rabbit *broker.RabbitMQ) (*Bot, error) {
+	trimmedToken := strings.TrimSpace(token)
+	if trimmedToken == "" {
+		return nil, fmt.Errorf("telegram bot token must not be empty")
+	}
+	if strings.ContainsAny(trimmedToken, " \t\r\n") {
+		return nil, fmt.Errorf("telegram bot token must not contain whitespace")
+	}
+	if allowedUserID <= 0 {
+		return nil, fmt.Errorf("allowed user ID must be positive, got %d", allowedUserID)
+	}
+	if rabbit == nil {
+		return nil, fmt.Errorf("rabbitmq broker must not be nil")
+	}
+
 	pref := tele.Settings{
-		Token:  token,
+		Token:  trimmedToken,
 		Poller: &tele.LongPoller{Timeout: 10 * time.Second},
 	}
 
@@ -153,8 +167,25 @@ func (b *Bot) renderBaseHTML(c tele.Context) (string, string) {
 func (b *Bot) registerHandlers() {
 	b.tg.Use(func(next tele.HandlerFunc) tele.HandlerFunc {
 		return func(c tele.Context) error {
-			if b.allowedUserID != 0 && (c.Sender() == nil || c.Sender().ID != b.allowedUserID) {
-				slog.Warn("blocked unauthorized telegram access", "sender", c.Sender())
+			sender := c.Sender()
+			chat := c.Chat()
+			if b.allowedUserID <= 0 || sender == nil || sender.ID != b.allowedUserID ||
+				chat == nil || chat.ID != b.allowedUserID ||
+				(chat.Type != "" && chat.Type != tele.ChatPrivate) {
+				var senderID, chatID int64
+				var username string
+				if sender != nil {
+					senderID = sender.ID
+					username = sender.Username
+				}
+				if chat != nil {
+					chatID = chat.ID
+				}
+				slog.Warn("blocked unauthorized telegram access",
+					"sender_id", senderID,
+					"username", username,
+					"chat_id", chatID,
+				)
 				return nil
 			}
 			return next(c)

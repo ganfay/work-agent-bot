@@ -3,13 +3,133 @@ package broker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
 )
+
+var amqpURLPattern = regexp.MustCompile(`amqps?://[^\s"'<>]+`)
+
+type sanitizedError struct {
+	msg   string
+	cause error
+}
+
+func (e *sanitizedError) Error() string {
+	return e.msg
+}
+
+func (e *sanitizedError) Unwrap() error {
+	return e.cause
+}
+
+func redactAMQPURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		if u.User != nil {
+			u.User = url.UserPassword("xxxxx", "xxxxx")
+			return u.String()
+		}
+		return rawURL
+	}
+
+	schemeIdx := strings.Index(rawURL, "://")
+	if schemeIdx < 0 {
+		return rawURL
+	}
+	prefix := rawURL[:schemeIdx+3]
+	rest := rawURL[schemeIdx+3:]
+
+	authEnd := len(rest)
+	for _, sep := range []string{"/", "?", "#"} {
+		if idx := strings.Index(rest, sep); idx >= 0 && idx < authEnd {
+			authEnd = idx
+		}
+	}
+	authority := rest[:authEnd]
+	suffix := rest[authEnd:]
+
+	atIdx := strings.LastIndex(authority, "@")
+	if atIdx < 0 {
+		return rawURL
+	}
+	return prefix + "xxxxx:xxxxx@" + authority[atIdx+1:] + suffix
+}
+
+func extractUserinfoAt(rawURL string) string {
+	schemeIdx := strings.Index(rawURL, "://")
+	if schemeIdx < 0 {
+		return ""
+	}
+	rest := rawURL[schemeIdx+3:]
+	authEnd := len(rest)
+	for _, sep := range []string{"/", "?", "#"} {
+		if idx := strings.Index(rest, sep); idx >= 0 && idx < authEnd {
+			authEnd = idx
+		}
+	}
+	authority := rest[:authEnd]
+	atIdx := strings.LastIndex(authority, "@")
+	if atIdx <= 0 {
+		return ""
+	}
+	return authority[:atIdx+1]
+}
+
+func redactErrorText(msg string, rawURLs ...string) string {
+	out := msg
+	for _, raw := range rawURLs {
+		if raw == "" {
+			continue
+		}
+		if redacted := redactAMQPURL(raw); redacted != raw {
+			out = strings.ReplaceAll(out, raw, redacted)
+		}
+		if userinfoAt := extractUserinfoAt(raw); userinfoAt != "" {
+			out = strings.ReplaceAll(out, userinfoAt, "xxxxx:xxxxx@")
+		}
+	}
+	return amqpURLPattern.ReplaceAllStringFunc(out, redactAMQPURL)
+}
+
+func sanitizeAMQPError(err error, rawURL string) error {
+	if err == nil {
+		return nil
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		innerErr := sanitizeAMQPError(urlErr.Err, rawURL)
+		redactedURL := redactAMQPURL(urlErr.URL)
+		if direct, ok := err.(*url.Error); ok && direct == urlErr {
+			return &url.Error{
+				Op:  urlErr.Op,
+				URL: redactedURL,
+				Err: innerErr,
+			}
+		}
+		return &sanitizedError{
+			msg:   redactErrorText(err.Error(), rawURL, urlErr.URL),
+			cause: innerErr,
+		}
+	}
+
+	msg := err.Error()
+	redactedMsg := redactErrorText(msg, rawURL)
+	if redactedMsg == msg {
+		return err
+	}
+	return errors.New(redactedMsg)
+}
 
 type Proposal struct {
 	BatchEOF        bool     `json:"_batch_eof,omitempty"`
@@ -32,7 +152,7 @@ type RabbitMQ struct {
 func NewRabbitMQ(url string) (*RabbitMQ, error) {
 	conn, err := amqp.Dial(url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", err)
+		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", sanitizeAMQPError(err, url))
 	}
 
 	consumeCh, err := conn.Channel()

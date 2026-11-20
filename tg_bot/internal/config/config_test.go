@@ -14,9 +14,13 @@ func setRequiredBotEnv(t *testing.T) {
 }
 
 func TestLoadConfig_BatchDefaultsAndOverrides(t *testing.T) {
+	t.Chdir(t.TempDir())
 	setRequiredBotEnv(t)
 
-	cfg := LoadConfig("/nonexistent/.env")
+	cfg, err := LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("unexpected LoadConfig error: %v", err)
+	}
 	if cfg.Bot.RunOnce {
 		t.Fatalf("expected RunOnce default false")
 	}
@@ -30,19 +34,26 @@ func TestLoadConfig_BatchDefaultsAndOverrides(t *testing.T) {
 	t.Setenv("RUN_ONCE", "true")
 	t.Setenv("TG_BATCH_IDLE_TIMEOUT", "45s")
 	t.Setenv("TG_POLL_GRACE", "20s")
-	cfg = LoadConfig("/nonexistent/.env")
+	cfg, err = LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("unexpected LoadConfig override error: %v", err)
+	}
 	if !cfg.Bot.RunOnce || cfg.Bot.BatchIdleTimeout != 45*time.Second || cfg.Bot.PollGrace != 20*time.Second {
 		t.Fatalf("unexpected overrides: %+v", cfg.Bot)
 	}
 }
 
 func TestConfig_URLEncodesPasswordAndNormalizesDurations(t *testing.T) {
+	t.Chdir(t.TempDir())
 	setRequiredBotEnv(t)
 	t.Setenv("RMQ_PASS", "p@ss:word/1")
 	t.Setenv("TG_BATCH_IDLE_TIMEOUT", "0s")
 	t.Setenv("TG_POLL_GRACE", "-5s")
 
-	cfg := LoadConfig("/nonexistent/.env")
+	cfg, err := LoadConfig("/nonexistent/.env")
+	if err != nil {
+		t.Fatalf("unexpected LoadConfig error: %v", err)
+	}
 	wantURL := "amqp://ru:p%40ss%3Aword%2F1@localhost:5672/"
 	if got := cfg.RabbitMQURL(); got != wantURL {
 		t.Fatalf("unexpected RabbitMQURL:\n got: %s\nwant: %s", got, wantURL)

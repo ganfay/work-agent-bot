@@ -19,7 +19,11 @@ import (
 )
 
 func main() {
-	cfg := config.LoadConfig("../.env")
+	cfg, err := config.LoadConfig("../.env")
+	if err != nil {
+		slog.Error("failed to load bot configuration", "error", err)
+		os.Exit(1)
+	}
 
 	logger.Setup(cfg.Bot.LogPath)
 	slog.Info("starting telegram bot service")
