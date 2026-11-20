@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -22,7 +24,124 @@ const (
 	closeTimeout = 2 * time.Second
 )
 
-var errClientClosed = errors.New("rabbitmq client is closed")
+var (
+	errClientClosed = errors.New("rabbitmq client is closed")
+	amqpURLPattern  = regexp.MustCompile(`amqps?://[^\s"'<>]+`)
+)
+
+type sanitizedError struct {
+	msg   string
+	cause error
+}
+
+func (e *sanitizedError) Error() string {
+	return e.msg
+}
+
+func (e *sanitizedError) Unwrap() error {
+	return e.cause
+}
+
+func redactAMQPURL(rawURL string) string {
+	if rawURL == "" {
+		return ""
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		if u.User != nil {
+			u.User = url.UserPassword("xxxxx", "xxxxx")
+			return u.String()
+		}
+		return rawURL
+	}
+
+	schemeIdx := strings.Index(rawURL, "://")
+	if schemeIdx < 0 {
+		return rawURL
+	}
+	prefix := rawURL[:schemeIdx+3]
+	rest := rawURL[schemeIdx+3:]
+
+	authEnd := len(rest)
+	for _, sep := range []string{"/", "?", "#"} {
+		if idx := strings.Index(rest, sep); idx >= 0 && idx < authEnd {
+			authEnd = idx
+		}
+	}
+	authority := rest[:authEnd]
+	suffix := rest[authEnd:]
+
+	atIdx := strings.LastIndex(authority, "@")
+	if atIdx < 0 {
+		return rawURL
+	}
+	return prefix + "xxxxx:xxxxx@" + authority[atIdx+1:] + suffix
+}
+
+func extractUserinfoAt(rawURL string) string {
+	schemeIdx := strings.Index(rawURL, "://")
+	if schemeIdx < 0 {
+		return ""
+	}
+	rest := rawURL[schemeIdx+3:]
+	authEnd := len(rest)
+	for _, sep := range []string{"/", "?", "#"} {
+		if idx := strings.Index(rest, sep); idx >= 0 && idx < authEnd {
+			authEnd = idx
+		}
+	}
+	authority := rest[:authEnd]
+	atIdx := strings.LastIndex(authority, "@")
+	if atIdx <= 0 {
+		return ""
+	}
+	return authority[:atIdx+1]
+}
+
+func redactErrorText(msg string, rawURLs ...string) string {
+	out := msg
+	for _, raw := range rawURLs {
+		if raw == "" {
+			continue
+		}
+		if redacted := redactAMQPURL(raw); redacted != raw {
+			out = strings.ReplaceAll(out, raw, redacted)
+		}
+		if userinfoAt := extractUserinfoAt(raw); userinfoAt != "" {
+			out = strings.ReplaceAll(out, userinfoAt, "xxxxx:xxxxx@")
+		}
+	}
+	return amqpURLPattern.ReplaceAllStringFunc(out, redactAMQPURL)
+}
+
+func sanitizeAMQPError(err error, rawURL string) error {
+	if err == nil {
+		return nil
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		innerErr := sanitizeAMQPError(urlErr.Err, rawURL)
+		redactedURL := redactAMQPURL(urlErr.URL)
+		if direct, ok := err.(*url.Error); ok && direct == urlErr {
+			return &url.Error{
+				Op:  urlErr.Op,
+				URL: redactedURL,
+				Err: innerErr,
+			}
+		}
+		return &sanitizedError{
+			msg:   redactErrorText(err.Error(), rawURL, urlErr.URL),
+			cause: innerErr,
+		}
+	}
+
+	msg := err.Error()
+	redactedMsg := redactErrorText(msg, rawURL)
+	if redactedMsg == msg {
+		return err
+	}
+	return errors.New(redactedMsg)
+}
 
 type deferredConfirmation interface {
 	WaitContext(ctx context.Context) (bool, error)
@@ -113,7 +232,7 @@ func defaultDial(ctx context.Context, url string) (amqpConn, error) {
 		},
 	})
 	if err != nil {
-		return nil, err
+		return nil, sanitizeAMQPError(err, url)
 	}
 	return &realAMQPConn{conn: conn}, nil
 }
@@ -179,11 +298,11 @@ func (r *RabbitMQ) resetChannelLocked() {
 }
 
 func (r *RabbitMQ) resetLocked() {
-	r.resetChannelLocked()
 	if r.conn != nil {
 		_ = r.conn.Close()
 		r.conn = nil
 	}
+	r.resetChannelLocked()
 }
 
 func (r *RabbitMQ) openConfirmedChannelLocked() (amqpChannel, error) {
@@ -192,13 +311,11 @@ func (r *RabbitMQ) openConfirmedChannelLocked() (amqpChannel, error) {
 		return nil, fmt.Errorf("failed to open channel: %w", err)
 	}
 	if err := ch.Confirm(false); err != nil {
-		_ = ch.Close()
-		return nil, fmt.Errorf("failed to enable publisher confirms: %w", err)
+		return ch, fmt.Errorf("failed to enable publisher confirms: %w", err)
 	}
 	for _, qName := range r.queueOrder {
 		if _, err := ch.QueueDeclare(qName, true, false, false, false, nil); err != nil {
-			_ = ch.Close()
-			return nil, fmt.Errorf("failed to redeclare queue %q: %w", qName, err)
+			return ch, fmt.Errorf("failed to redeclare queue %q: %w", qName, err)
 		}
 	}
 	return ch, nil
@@ -212,20 +329,16 @@ func (r *RabbitMQ) ensureChannelLocked(ctx context.Context) (amqpChannel, error)
 		return r.ch, nil
 	}
 
-	r.resetChannelLocked()
-
 	if r.conn != nil && !r.conn.IsClosed() {
+		r.resetChannelLocked()
 		ch, err := r.openConfirmedChannelLocked()
 		if err == nil {
 			r.ch = ch
 			return ch, nil
 		}
-		_ = r.conn.Close()
-		r.conn = nil
-	} else if r.conn != nil {
-		_ = r.conn.Close()
-		r.conn = nil
+		r.ch = ch
 	}
+	r.resetLocked()
 
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -233,14 +346,14 @@ func (r *RabbitMQ) ensureChannelLocked(ctx context.Context) (amqpChannel, error)
 
 	conn, err := r.dial(ctx, r.url)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", err)
+		return nil, fmt.Errorf("failed to connect to rabbitmq: %w", sanitizeAMQPError(err, r.url))
 	}
 	r.conn = conn
 
 	ch, err := r.openConfirmedChannelLocked()
 	if err != nil {
-		_ = r.conn.Close()
-		r.conn = nil
+		r.ch = ch
+		r.resetLocked()
 		return nil, err
 	}
 	r.ch = ch
@@ -276,7 +389,11 @@ func (r *RabbitMQ) DeclareQueue(name string) (amqp.Queue, error) {
 		nil,   // args
 	)
 	if err != nil {
-		r.resetChannelLocked()
+		if r.conn == nil || r.conn.IsClosed() {
+			r.resetLocked()
+		} else {
+			r.resetChannelLocked()
+		}
 		return amqp.Queue{}, fmt.Errorf("failed to declare queue %q: %w", name, err)
 	}
 
