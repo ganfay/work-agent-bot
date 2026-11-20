@@ -5,7 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 AI_WORKER_DIR = Path(__file__).resolve().parent.parent
 if str(AI_WORKER_DIR) not in sys.path:
@@ -93,7 +93,7 @@ class TestRabbitMQConsumerBatch(unittest.TestCase):
         last_body = json.loads(publish_calls[0].kwargs["body"].decode("utf-8"))
         self.assertEqual(last_body, {"_batch_eof": True})
 
-    def test_consume_batch_nacks_bad_json_and_handler_error(self):
+    def test_consume_batch_routes_bad_json_and_handler_error_to_dlq(self):
         consumer = self._make_consumer()
         m_bad_json = SimpleNamespace(delivery_tag=10)
         m_bad_handler = SimpleNamespace(delivery_tag=11)
@@ -110,9 +110,21 @@ class TestRabbitMQConsumerBatch(unittest.TestCase):
 
         consumer.consume_batch(failing_handler, idle_timeout=5.0)
 
-        consumer.channel.basic_nack.assert_any_call(delivery_tag=10, requeue=False)
-        consumer.channel.basic_nack.assert_any_call(delivery_tag=11, requeue=False)
-        consumer.channel.basic_ack.assert_called_once_with(delivery_tag=12)
+        dlq_calls = [
+            call for call in consumer.channel.basic_publish.call_args_list
+            if call.kwargs.get("routing_key") == "new_vacancies.dlq"
+        ]
+        self.assertEqual(len(dlq_calls), 2)
+        first_dlq = json.loads(dlq_calls[0].kwargs["body"].decode("utf-8"))
+        second_dlq = json.loads(dlq_calls[1].kwargs["body"].decode("utf-8"))
+        self.assertEqual(first_dlq["original_queue"], "new_vacancies")
+        self.assertIn("json_decode", first_dlq["error_reason"])
+        self.assertEqual(second_dlq["payload"], {"Title": "Boom"})
+        self.assertIn("handler_error", second_dlq["error_reason"])
+        consumer.channel.basic_nack.assert_not_called()
+        consumer.channel.basic_ack.assert_any_call(delivery_tag=10)
+        consumer.channel.basic_ack.assert_any_call(delivery_tag=11)
+        consumer.channel.basic_ack.assert_any_call(delivery_tag=12)
 
     def test_consume_batch_does_not_publish_eof_on_interrupt(self):
         consumer = self._make_consumer()
@@ -199,6 +211,7 @@ class TestMainModes(unittest.TestCase):
             mock_consumer.consume_batch.assert_called_once_with(
                 message_handler=worker_main.process_vacancy,
                 idle_timeout=7.0,
+                stop_event=ANY,
             )
             mock_consumer.start_consuming.assert_not_called()
             mock_consumer.close.assert_called_once()

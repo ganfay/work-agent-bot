@@ -11,8 +11,18 @@ import time
 import psycopg2
 import pika
 
+from broker.consumer import (
+    build_pika_parameters,
+    is_channel_open,
+    is_connection_open,
+    publish_to_dlq,
+    safe_ack,
+    safe_nack,
+)
 from config.config import settings
 from core.sanitize import redact_url
+
+FEEDBACK_DLQ_NAME = "feedback_queue.dlq"
 
 logger = logging.getLogger("ai_worker")
 
@@ -73,6 +83,15 @@ def _persist_feedback(pg_url: str | None, job_title: str, reason: str, conn=None
             db_conn.close()
 
 
+def _route_feedback_to_dlq(ch, delivery_tag, body: bytes, reason: str) -> None:
+    if not is_channel_open(ch):
+        return
+    if publish_to_dlq(ch, FEEDBACK_DLQ_NAME, "feedback_queue", body, reason):
+        safe_ack(ch, delivery_tag)
+    else:
+        safe_nack(ch, delivery_tag, requeue=False)
+
+
 def start_feedback_listener_thread(stop_event: threading.Event | None = None):
     """Запускає фоновий потік, який слухає feedback_queue з RabbitMQ із автоматичним перепідключенням."""
     def run():
@@ -84,6 +103,7 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                 connection = pika.BlockingConnection(params)
                 channel = connection.channel()
                 channel.queue_declare(queue="feedback_queue", durable=True)
+                channel.queue_declare(queue=FEEDBACK_DLQ_NAME, durable=True)
                 channel.basic_qos(prefetch_count=1)
 
                 backoff = 1.0
@@ -98,21 +118,34 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                         reason = str(data.get("reason", "No reason"))
                     except Exception as e:
                         logger.error(f"[FeedbackEngine] Invalid feedback payload: {e}")
-                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                        _route_feedback_to_dlq(ch, method.delivery_tag, body, f"invalid_payload: {e}")
                         return
 
                     try:
                         logger.info(f"[FeedbackEngine] Captured human rejection for '{job_title}': '{reason}'")
                         _persist_feedback(None, job_title, reason)
-                        ch.basic_ack(delivery_tag=method.delivery_tag)
+                        safe_ack(ch, method.delivery_tag)
                         logger.info("[FeedbackEngine] Stored feedback in PostgreSQL successfully.")
                     except Exception as e:
                         logger.error(f"[FeedbackEngine] Error storing feedback in PostgreSQL: {redact_url(e)}")
-                        requeue = not method.redelivered
-                        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=requeue)
+                        if not getattr(method, "redelivered", False):
+                            safe_nack(ch, method.delivery_tag, requeue=True)
+                        else:
+                            _route_feedback_to_dlq(ch, method.delivery_tag, body, f"db_error: {e}")
 
                 channel.basic_consume(queue="feedback_queue", on_message_callback=callback)
-                channel.start_consuming()
+                if stop_event is not None:
+                    while not stop_event.is_set():
+                        connection.process_data_events(time_limit=1.0)
+                        if not is_channel_open(channel) or not is_connection_open(connection):
+                            break
+                    if is_channel_open(channel):
+                        try:
+                            channel.stop_consuming()
+                        except Exception:
+                            pass
+                else:
+                    channel.start_consuming()
 
             except Exception as e:
                 if stop_event is not None and stop_event.is_set():
@@ -120,10 +153,13 @@ def start_feedback_listener_thread(stop_event: threading.Event | None = None):
                 logger.error(
                     f"[FeedbackEngine] Feedback listener disconnected: {redact_url(e)}. Reconnecting in {backoff:.1f}s..."
                 )
-                time.sleep(backoff)
+                if stop_event is not None:
+                    stop_event.wait(backoff)
+                else:
+                    time.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
             finally:
-                if connection is not None and not connection.is_closed:
+                if is_connection_open(connection):
                     try:
                         connection.close()
                     except Exception:
@@ -141,14 +177,13 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
     pg_conn = None
     try:
         if amqp_url:
-            params = pika.URLParameters(amqp_url)
-            params.heartbeat = 600
-            params.blocked_connection_timeout = 300
+            params = build_pika_parameters(amqp_url)
         else:
             params = settings.rmq_connection_parameters()
         connection = pika.BlockingConnection(params)
         channel = connection.channel()
         channel.queue_declare(queue="feedback_queue", durable=True)
+        channel.queue_declare(queue=FEEDBACK_DLQ_NAME, durable=True)
 
         while True:
             method_frame, _, body = channel.basic_get(queue="feedback_queue", auto_ack=False)
@@ -169,12 +204,12 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
 
                 _persist_feedback(db_url, job_title, reason, conn=pg_conn)
 
-                channel.basic_ack(delivery_tag=method_frame.delivery_tag)
+                safe_ack(channel, method_frame.delivery_tag)
                 processed += 1
                 logger.info(f"[FeedbackEngine] Drained feedback for '{job_title}': '{reason}'")
             except Exception as e:
                 logger.error(f"[FeedbackEngine] Error draining feedback message: {redact_url(e)}")
-                channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)
+                _route_feedback_to_dlq(channel, method_frame.delivery_tag, body, f"drain_error: {e}")
     except Exception as e:
         logger.error(f"[FeedbackEngine] Failed to drain feedback_queue: {redact_url(e)}")
     finally:
@@ -183,6 +218,9 @@ def drain_feedback_queue(amqp_url: str | None = None, db_url: str | None = None)
                 pg_conn.close()
             except Exception:
                 pass
-        if connection is not None and not connection.is_closed:
-            connection.close()
+        if is_connection_open(connection):
+            try:
+                connection.close()
+            except Exception:
+                pass
     return processed

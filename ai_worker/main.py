@@ -1,6 +1,7 @@
 import re
 import signal
 import sys
+import threading
 import psycopg2
 
 from broker.consumer import RabbitMQConsumer
@@ -196,11 +197,20 @@ def main():
         queue_name=settings.queue_name,
         connection_params=settings.rmq_connection_parameters(),
     )
+    stop_event = threading.Event()
+    feedback_thread = None
 
-    def _handle_sigterm(signum, frame):
-        raise KeyboardInterrupt()
+    def _handle_shutdown(signum, frame):
+        logger.info(f"Received signal {signum}; requesting graceful shutdown...")
+        stop_event.set()
+        try:
+            consumer.request_stop()
+        except Exception:
+            pass
 
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _handle_shutdown)
+        signal.signal(signal.SIGINT, _handle_shutdown)
 
     try:
         if settings.run_once:
@@ -209,27 +219,32 @@ def main():
             consumer.consume_batch(
                 message_handler=process_vacancy,
                 idle_timeout=settings.batch_idle_timeout,
+                stop_event=stop_event,
             )
-            drain_feedback_queue()
-            consumer.close()
+            if not stop_event.is_set():
+                drain_feedback_queue()
             logger.info("RUN_ONCE=true: AI Worker batch run completed, exiting cleanly.")
             return
 
-        start_feedback_listener_thread()
+        feedback_thread = start_feedback_listener_thread(stop_event=stop_event)
         consumer.connect()
-        consumer.start_consuming(message_handler=process_vacancy)
+        consumer.start_consuming(message_handler=process_vacancy, stop_event=stop_event)
 
     except KeyboardInterrupt:
         logger.info("Shutdown signal received. Closing worker...")
-        consumer.close()
+        stop_event.set()
         sys.exit(0)
 
     except Exception as err:
         logger.critical(f"Fatal worker error: {redact_url(err)}", exc_info=True)
-        consumer.close()
+        stop_event.set()
         sys.exit(1)
 
     finally:
+        stop_event.set()
+        consumer.close()
+        if feedback_thread is not None:
+            feedback_thread.join(timeout=5.0)
         close_agents()
 
 
