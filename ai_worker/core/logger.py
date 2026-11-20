@@ -5,7 +5,9 @@ from logging.handlers import RotatingFileHandler
 
 
 def setup_logger(log_file_path: str = "logs/ai_worker.log", level: int = logging.INFO) -> logging.Logger:
-    os.makedirs(os.path.dirname(log_file_path), exist_ok=True)
+    log_dir = os.path.dirname(log_file_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
 
     logger = logging.getLogger("ai_worker")
     logger.setLevel(level)

@@ -1,10 +1,12 @@
 import logging
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
 from agents.validator import ValidationResult
+from config.config import settings
+from core.llm import call_with_retry
 
 logger = logging.getLogger("ai_worker")
 
@@ -22,9 +24,9 @@ class DraftResult(BaseModel):
 
 
 class CoverLetterDrafter:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model_name: Optional[str] = None):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3.5-flash-lite"
+        self.model_name = model_name or settings.gemini_model
 
     def draft(self, title: str, description: str, validation: ValidationResult) -> DraftResult:
         logger.info(f"[Drafter] Drafting personalized cover letter for: '{title}'...")
@@ -63,7 +65,7 @@ class CoverLetterDrafter:
         Draft a concise, tailored cover letter based STRICTLY on the verified facts above.
         """
 
-        try:
+        def _call():
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
@@ -74,15 +76,10 @@ class CoverLetterDrafter:
                     temperature=0.5,
                 ),
             )
+            if not response.text:
+                raise RuntimeError("Gemini Drafter returned empty response text")
+            return DraftResult.model_validate_json(response.text)
 
-            result: DraftResult = DraftResult.model_validate_json(response.text)
-            logger.info(f"[Drafter] Generated letter ({result.word_count} words).")
-            return result
-
-        except Exception as err:
-            logger.error(f"[Drafter] Failed to draft cover letter: {err}", exc_info=True)
-            return DraftResult(
-                cover_letter="Failed to generate draft due to an internal error.",
-                highlighted_proofs=[],
-                word_count=0
-            )
+        result: DraftResult = call_with_retry(_call, operation="CoverLetterDrafter.draft")
+        logger.info(f"[Drafter] Generated letter ({result.word_count} words).")
+        return result

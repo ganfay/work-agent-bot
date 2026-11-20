@@ -1,6 +1,7 @@
 import os
 import json
 from pathlib import Path
+from urllib.parse import quote
 from dotenv import load_dotenv
 
 CURRENT_DIR = Path(__file__).resolve().parent
@@ -30,19 +31,33 @@ class Config:
         self.rmq_port = os.getenv("RMQ_PORT", "5672")
 
         # 3. AI Settings
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip() or "gemini-3.5-flash-lite"
+        self.gemini_embedding_model = (
+            os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001").strip() or "gemini-embedding-001"
+        )
 
         # 4. Worker Settings
         self.queue_name = "new_vacancies"
-        self.log_path = "logs/ai_worker.log"
+        self.log_path = os.getenv("AI_LOG_PATH", "logs/ai_worker.log").strip() or "logs/ai_worker.log"
         self.run_once = os.getenv("RUN_ONCE", "false").strip().lower() in ("true", "1", "yes")
-        raw_idle = (os.getenv("AI_BATCH_IDLE_TIMEOUT") or os.getenv("BATCH_IDLE_TIMEOUT") or "20").strip()
-        if raw_idle.endswith("s"):
-            raw_idle = raw_idle[:-1].strip()
-        self.batch_idle_timeout = float(raw_idle)
+        self.batch_idle_timeout = self._parse_idle_timeout(
+            os.getenv("AI_BATCH_IDLE_TIMEOUT") or os.getenv("BATCH_IDLE_TIMEOUT") or "20"
+        )
 
         # 5. Candidate Profile (Dynamic JSON)
         self.profile_data = self._load_profile()
+
+    @staticmethod
+    def _parse_idle_timeout(raw: str, default: float = 20.0) -> float:
+        cleaned = raw.strip()
+        if cleaned.endswith("s"):
+            cleaned = cleaned[:-1].strip()
+        try:
+            val = float(cleaned)
+            return val if val > 0 else default
+        except ValueError:
+            return default
 
     def _load_profile(self) -> dict:
         paths = [
@@ -61,10 +76,14 @@ class Config:
         return {}
 
     def rabbitmq_url(self) -> str:
-        return f"amqp://{self.rmq_user}:{self.rmq_pass}@{self.rmq_host}:{self.rmq_port}/"
+        user = quote(self.rmq_user, safe="")
+        password = quote(self.rmq_pass, safe="")
+        return f"amqp://{user}:{password}@{self.rmq_host}:{self.rmq_port}/"
 
     def database_url(self) -> str:
-        return f"postgresql://{self.db_user}:{self.db_password}@{self.db_host}:{self.db_port}/{self.db_name}"
+        user = quote(self.db_user, safe="")
+        password = quote(self.db_password, safe="")
+        return f"postgresql://{user}:{password}@{self.db_host}:{self.db_port}/{self.db_name}"
 
 
 settings = Config()

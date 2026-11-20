@@ -35,3 +35,22 @@ func TestLoadConfig_BatchDefaultsAndOverrides(t *testing.T) {
 		t.Fatalf("unexpected overrides: %+v", cfg.Bot)
 	}
 }
+
+func TestConfig_URLEncodesPasswordAndNormalizesDurations(t *testing.T) {
+	setRequiredBotEnv(t)
+	t.Setenv("RMQ_PASS", "p@ss:word/1")
+	t.Setenv("TG_BATCH_IDLE_TIMEOUT", "0s")
+	t.Setenv("TG_POLL_GRACE", "-5s")
+
+	cfg := LoadConfig("/nonexistent/.env")
+	wantURL := "amqp://ru:p%40ss%3Aword%2F1@localhost:5672/"
+	if got := cfg.RabbitMQURL(); got != wantURL {
+		t.Fatalf("unexpected RabbitMQURL:\n got: %s\nwant: %s", got, wantURL)
+	}
+	if cfg.Bot.BatchIdleTimeout != 90*time.Second {
+		t.Fatalf("expected non-positive idle timeout to normalize to 90s, got %v", cfg.Bot.BatchIdleTimeout)
+	}
+	if cfg.Bot.PollGrace != 0 {
+		t.Fatalf("expected negative poll grace to clamp to 0, got %v", cfg.Bot.PollGrace)
+	}
+}

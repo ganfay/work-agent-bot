@@ -47,6 +47,22 @@ class RabbitMQConsumer:
         def callback(ch, method, properties, body):
             try:
                 payload = json.loads(body.decode("utf-8"))
+            except Exception as err:
+                logger.error(f"Failed to decode message JSON: {err}", exc_info=True)
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                return
+
+            if not isinstance(payload, dict):
+                logger.error("Received non-object JSON payload on queue; discarding.")
+                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+                return
+
+            if payload.get("_batch_eof") is True:
+                ch.basic_ack(delivery_tag=method.delivery_tag)
+                logger.info(f"Ignored batch EOF marker in daemon mode on '{self.queue_name}'.")
+                return
+
+            try:
                 title = payload.get("Title", "No Title")
                 logger.info(f"Received vacancy: '{title}'")
 
@@ -98,6 +114,8 @@ class RabbitMQConsumer:
 
                 try:
                     payload = json.loads(body.decode("utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("message payload must be a JSON object")
                 except Exception as err:
                     logger.error(f"Failed to decode message JSON: {err}", exc_info=True)
                     self.channel.basic_nack(delivery_tag=method_frame.delivery_tag, requeue=False)

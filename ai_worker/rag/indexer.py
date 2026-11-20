@@ -27,32 +27,31 @@ def index_knowledge_base():
         logger.error("No knowledge chunks found in candidate_profile.json to index!")
         return
 
-    logger.info("Connecting to PostgreSQL to index codebase embeddings...")
-    conn = psycopg2.connect(settings.database_url())
-    register_vector(conn)
-    cursor = conn.cursor()
-
-    cursor.execute("TRUNCATE TABLE code_embeddings;")
-    conn.commit()
-
-    logger.info(f"Generating embeddings and indexing {len(chunks)} knowledge chunks into pgvector...")
-
+    logger.info(f"Generating embeddings for {len(chunks)} knowledge chunks before updating pgvector...")
+    prepared_rows = []
     for i, chunk in enumerate(chunks, start=1):
         vector = embedder.embed_text(chunk["content"])
+        prepared_rows.append((chunk["project"], chunk["category"], chunk["content"], vector))
+        logger.info(f"[{i}/{len(chunks)}] Embedded: {chunk['project']} - {chunk['category']}")
 
-        cursor.execute(
-            """
-            INSERT INTO code_embeddings (project_name, category, content, embedding)
-            VALUES (%s, %s, %s, %s);
-            """,
-            (chunk["project"], chunk["category"], chunk["content"], vector)
-        )
-        logger.info(f"[{i}/{len(chunks)}] Indexed: {chunk['project']} - {chunk['category']}")
-
-    conn.commit()
-    cursor.close()
-    conn.close()
-    logger.info("Successfully indexed all knowledge chunks into pgvector!")
+    logger.info("Connecting to PostgreSQL to atomically replace codebase embeddings...")
+    conn = psycopg2.connect(settings.database_url())
+    try:
+        register_vector(conn)
+        with conn:
+            with conn.cursor() as cursor:
+                cursor.execute("TRUNCATE TABLE code_embeddings;")
+                for project, category, content, vector in prepared_rows:
+                    cursor.execute(
+                        """
+                        INSERT INTO code_embeddings (project_name, category, content, embedding)
+                        VALUES (%s, %s, %s, %s);
+                        """,
+                        (project, category, content, vector),
+                    )
+        logger.info(f"Successfully indexed {len(prepared_rows)} knowledge chunks into pgvector!")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

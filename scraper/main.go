@@ -62,6 +62,7 @@ func main() {
 
 type JobRepository interface {
 	SaveJobIfNotExists(ctx context.Context, job djinni.Job) (bool, error)
+	DeleteJobByGUID(ctx context.Context, guid string) error
 }
 
 type JobPublisher interface {
@@ -69,7 +70,7 @@ type JobPublisher interface {
 	PublishBatchEOF(ctx context.Context, queueName string) error
 }
 
-type JobFetcher func(rssURL string) ([]djinni.Job, error)
+type JobFetcher func(ctx context.Context, rssURL string) ([]djinni.Job, error)
 
 func run(
 	ctx context.Context,
@@ -96,10 +97,16 @@ func run(
 		return
 	}
 
-	ticker := time.NewTicker(cfg.Scraper.Interval)
+	interval := cfg.Scraper.Interval
+	if interval <= 0 {
+		slog.Warn("non-positive SCRAPE_INTERVAL configured; falling back to 15m", "configured", interval)
+		interval = 15 * time.Minute
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	slog.Info("scraper service entered daemon mode", "interval", cfg.Scraper.Interval.String())
+	slog.Info("scraper service entered daemon mode", "interval", interval.String())
 
 	for {
 		select {
@@ -129,7 +136,7 @@ func runScrapeIteration(
 		return
 	}
 
-	jobs, err := fetchJobs(cfg.Scraper.RSSURL)
+	jobs, err := fetchJobs(ctx, cfg.Scraper.RSSURL)
 	if err != nil {
 		slog.Error("failed to fetch jobs from djinni", "error", err)
 		return
@@ -161,7 +168,12 @@ func runScrapeIteration(
 			cancel()
 
 			if err != nil {
-				slog.Error("failed to publish job to queue", "guid", job.GUID, "error", err)
+				slog.Error("failed to publish job to queue; rolling back db record for retry", "guid", job.GUID, "error", err)
+				rbCtx, rbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if rbErr := repo.DeleteJobByGUID(rbCtx, job.GUID); rbErr != nil {
+					slog.Error("failed to rollback job record after publish failure", "guid", job.GUID, "error", rbErr)
+				}
+				rbCancel()
 				continue
 			}
 

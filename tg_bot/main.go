@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -49,7 +50,7 @@ func main() {
 	}
 
 	slog.Info("telegram bot service started", "run_once", cfg.Bot.RunOnce)
-	runConsumerLoop(
+	if err := runConsumerLoop(
 		ctx,
 		msgs,
 		telegramBot,
@@ -57,9 +58,16 @@ func main() {
 		cfg.Bot.RunOnce,
 		cfg.Bot.BatchIdleTimeout,
 		cfg.Bot.PollGrace,
-	)
+	); err != nil {
+		slog.Error("consumer loop terminated with error", "error", err)
+		telegramBot.Stop()
+		rmq.Close()
+		os.Exit(1)
+	}
 	slog.Info("shutdown complete: closing connections...")
 }
+
+var errBrokerChannelClosed = errors.New("review_queue channel closed unexpectedly")
 
 type ProposalSender interface {
 	SendVacancy(userID int64, p broker.Proposal) error
@@ -73,12 +81,15 @@ func runConsumerLoop(
 	runOnce bool,
 	idleTimeout time.Duration,
 	pollGrace time.Duration,
-) {
+) error {
 	slog.Info("listening for AI proposals on 'review_queue'...")
 
 	var idleTimer *time.Timer
 	var idleCh <-chan time.Time
 	if runOnce {
+		if idleTimeout <= 0 {
+			idleTimeout = 90 * time.Second
+		}
 		idleTimer = time.NewTimer(idleTimeout)
 		defer idleTimer.Stop()
 		idleCh = idleTimer.C
@@ -89,7 +100,7 @@ consumeLoop:
 		select {
 		case <-ctx.Done():
 			slog.Info("stopping message consumer loop...")
-			return
+			return nil
 
 		case <-idleCh:
 			slog.Info("batch idle timeout reached on review_queue", "timeout", idleTimeout.String())
@@ -98,6 +109,9 @@ consumeLoop:
 		case msg, ok := <-msgs:
 			if !ok {
 				slog.Info("review_queue channel closed")
+				if !runOnce && ctx.Err() == nil {
+					return errBrokerChannelClosed
+				}
 				break consumeLoop
 			}
 
@@ -151,4 +165,5 @@ consumeLoop:
 		case <-graceTimer.C:
 		}
 	}
+	return nil
 }

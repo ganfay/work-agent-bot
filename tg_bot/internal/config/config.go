@@ -1,8 +1,9 @@
 package config
 
 import (
-	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -29,8 +30,22 @@ type Config struct {
 }
 
 func (c *Config) RabbitMQURL() string {
-	return fmt.Sprintf("amqp://%s:%s@%s:%s/",
-		c.RabbitMQ.User, c.RabbitMQ.Password, c.RabbitMQ.Host, c.RabbitMQ.Port)
+	u := &url.URL{
+		Scheme: "amqp",
+		User:   url.UserPassword(c.RabbitMQ.User, c.RabbitMQ.Password),
+		Host:   net.JoinHostPort(c.RabbitMQ.Host, c.RabbitMQ.Port),
+		Path:   "/",
+	}
+	return u.String()
+}
+
+func (c *Config) normalize() {
+	if c.Bot.BatchIdleTimeout <= 0 {
+		c.Bot.BatchIdleTimeout = 90 * time.Second
+	}
+	if c.Bot.PollGrace < 0 {
+		c.Bot.PollGrace = 0
+	}
 }
 
 func LoadConfig(envPath string) *Config {
@@ -41,6 +56,7 @@ func LoadConfig(envPath string) *Config {
 	if envPath != "" {
 		if _, statErr := os.Stat(envPath); statErr == nil {
 			if err = cleanenv.ReadConfig(envPath, &cfg); err == nil {
+				cfg.normalize()
 				return &cfg
 			}
 		}
@@ -49,6 +65,7 @@ func LoadConfig(envPath string) *Config {
 	// 2. Try current directory .env if exists
 	if _, statErr := os.Stat(".env"); statErr == nil {
 		if err = cleanenv.ReadConfig(".env", &cfg); err == nil {
+			cfg.normalize()
 			return &cfg
 		}
 	}
@@ -59,5 +76,6 @@ func LoadConfig(envPath string) *Config {
 		slog.Error("failed to load bot configuration", "error", err)
 		os.Exit(1)
 	}
+	cfg.normalize()
 	return &cfg
 }

@@ -58,3 +58,12 @@ func (r *JobRepository) SaveJobIfNotExists(ctx context.Context, job djinni.Job) 
 
 	return true, nil
 }
+
+// DeleteJobByGUID removes a job record, used as a compensating rollback if broker publishing fails.
+func (r *JobRepository) DeleteJobByGUID(ctx context.Context, guid string) error {
+	_, err := r.pool.Exec(ctx, `DELETE FROM jobs WHERE guid = $1;`, guid)
+	if err != nil {
+		return fmt.Errorf("failed to delete job %q: %w", guid, err)
+	}
+	return nil
+}

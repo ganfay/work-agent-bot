@@ -8,11 +8,13 @@ AGENT 2: EVIDENCE VALIDATOR (Векторний детектив фактів н
 """
 
 import logging
-from typing import List
+from typing import List, Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+from config.config import settings
+from core.llm import call_with_retry
 from rag.retriever import retriever
 
 logger = logging.getLogger("ai_worker")
@@ -49,22 +51,31 @@ class ValidationResult(BaseModel):
 # 2. КЛАС АГЕНТА-ВАЛІДАТОРА (RAG + pgvector)
 # ============================================================================
 class EvidenceValidator:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model_name: Optional[str] = None):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3.5-flash-lite"
+        self.model_name = model_name or settings.gemini_model
 
     def validate(self, extracted_stack: List[str]) -> ValidationResult:
         """
         Для кожної технології робить векторний пошук у pgvector,
         збирає знайдені шматки коду та передає в Gemini для строгого аудиту.
         """
+        if not extracted_stack:
+            logger.info("[Validator:pgvector] No technologies extracted; skipping RAG lookup and LLM call.")
+            return ValidationResult(
+                verified_skills=[],
+                unverified_skills=[],
+                dossier_summary="No specific technical stack requirements were extracted from the vacancy.",
+            )
+
         logger.info(f"[Validator:pgvector] Querying vector database for {len(extracted_stack)} technologies...")
 
-        # 1. ВЕКТОРНИЙ RAG: шукаємо докази в базі pgvector для кожної знайденої технології
+        # 1. ВЕКТОРНИЙ RAG: шукаємо докази в базі pgvector за одне підключення до PostgreSQL
+        batch_matches = retriever.search_evidence_batch(queries=extracted_stack, limit=1, threshold=0.48)
         retrieved_context_blocks = []
 
         for tech in extracted_stack:
-            matches = retriever.search_evidence(query=tech, limit=1, threshold=0.48)
+            matches = batch_matches.get(tech, [])
             if matches:
                 top = matches[0]
                 retrieved_context_blocks.append(
@@ -99,7 +110,7 @@ class EvidenceValidator:
         Classify into verified_skills and unverified_skills strictly based on the pgvector search results.
         """
 
-        try:
+        def _call():
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
@@ -110,17 +121,12 @@ class EvidenceValidator:
                     temperature=0.1,
                 ),
             )
+            if not response.text:
+                raise RuntimeError("Gemini Validator returned empty response text")
+            return ValidationResult.model_validate_json(response.text)
 
-            result: ValidationResult = ValidationResult.model_validate_json(response.text)
-            logger.info(
-                f"[Validator:pgvector] Verification complete: {len(result.verified_skills)} verified, {len(result.unverified_skills)} gaps."
-            )
-            return result
-
-        except Exception as err:
-            logger.error(f"[Validator] Failed to validate evidence: {err}", exc_info=True)
-            return ValidationResult(
-                verified_skills=[],
-                unverified_skills=extracted_stack,
-                dossier_summary=f"Validation failed due to error: {err}"
-            )
+        result: ValidationResult = call_with_retry(_call, operation="EvidenceValidator.validate")
+        logger.info(
+            f"[Validator:pgvector] Verification complete: {len(result.verified_skills)} verified, {len(result.unverified_skills)} gaps."
+        )
+        return result

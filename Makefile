@@ -21,6 +21,7 @@ help:
 	@echo "  make migrate-up     - Run database migrations on PostgreSQL"
 	@echo "  make migrate-down   - Roll back database migrations"
 	@echo "  make index          - Manually re-index pgvector embeddings"
+	@echo "  make test           - Run all Go (-race) and Python unit tests"
 	@echo "  make clean          - Stop containers and purge docker volumes"
 	@echo "======================================================================"
 
@@ -74,6 +75,12 @@ migrate-down:
 .PHONY: index
 index:
 	@make -C ai_worker index
+
+.PHONY: test
+test:
+	cd scraper && go test -v -race ./...
+	cd tg_bot && go test -v -race ./...
+	cd ai_worker && $(if $(wildcard ai_worker/.venv/bin/python),.venv/bin/python,python3) -m unittest discover -s tests -v
 
 .PHONY: clean
 clean:

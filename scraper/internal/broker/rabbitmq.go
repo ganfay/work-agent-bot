@@ -42,6 +42,9 @@ func (r *RabbitMQ) Close() {
 }
 
 func (r *RabbitMQ) DeclareQueue(name string) (amqp.Queue, error) {
+	if r.ch == nil {
+		return amqp.Queue{}, fmt.Errorf("rabbitmq channel is not initialized")
+	}
 	return r.ch.QueueDeclare(
 		name,
 		true,  // durable
@@ -53,6 +56,9 @@ func (r *RabbitMQ) DeclareQueue(name string) (amqp.Queue, error) {
 }
 
 func (r *RabbitMQ) PublishJob(ctx context.Context, queueName string, job djinni.Job) error {
+	if r.ch == nil {
+		return fmt.Errorf("rabbitmq channel is not initialized")
+	}
 	body, err := json.Marshal(job)
 	if err != nil {
 		return fmt.Errorf("failed to marshal job: %w", err)
@@ -72,6 +78,9 @@ func (r *RabbitMQ) PublishJob(ctx context.Context, queueName string, job djinni.
 }
 
 func (r *RabbitMQ) PublishBatchEOF(ctx context.Context, queueName string) error {
+	if r.ch == nil {
+		return fmt.Errorf("rabbitmq channel is not initialized")
+	}
 	return r.ch.PublishWithContext(ctx,
 		"",        // exchange
 		queueName, // routing key

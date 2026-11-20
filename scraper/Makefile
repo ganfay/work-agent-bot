@@ -2,7 +2,9 @@
 -include ../.env
 export
 
-DB_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@localhost:5432/$(PG_DB)?sslmode=disable
+PG_HOST ?= localhost
+PG_PORT ?= 5432
+DB_URL ?= postgres://$(PG_USER):$(PG_PASSWORD)@$(PG_HOST):$(PG_PORT)/$(PG_DB)?sslmode=disable
 MIGRATE_BIN := go run -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
 
 .PHONY: help

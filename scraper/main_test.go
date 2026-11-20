@@ -14,6 +14,7 @@ import (
 type fakeRepo struct {
 	mu      sync.Mutex
 	seen    map[string]bool
+	deleted []string
 	errGUID string
 }
 
@@ -31,6 +32,14 @@ func (r *fakeRepo) SaveJobIfNotExists(_ context.Context, job djinni.Job) (bool, 
 	}
 	r.seen[job.GUID] = true
 	return true, nil
+}
+
+func (r *fakeRepo) DeleteJobByGUID(_ context.Context, guid string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.seen, guid)
+	r.deleted = append(r.deleted, guid)
+	return nil
 }
 
 type fakePublisher struct {
@@ -75,7 +84,7 @@ func TestRun_RunOncePublishesNewJobsAndEOF(t *testing.T) {
 	cfg := testConfig(true)
 
 	fetchCalls := 0
-	fetcher := func(_ string) ([]djinni.Job, error) {
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
 		fetchCalls++
 		return []djinni.Job{
 			{GUID: "old-1", Title: "Already Seen"},
@@ -108,7 +117,7 @@ func TestRun_RunOnceEmptyFeedStillPublishesEOF(t *testing.T) {
 	pub := &fakePublisher{}
 	cfg := testConfig(true)
 
-	fetcher := func(_ string) ([]djinni.Job, error) {
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
 		return nil, nil
 	}
 
@@ -127,7 +136,7 @@ func TestRun_RunOnceFetchErrorStillPublishesEOF(t *testing.T) {
 	pub := &fakePublisher{}
 	cfg := testConfig(true)
 
-	fetcher := func(_ string) ([]djinni.Job, error) {
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
 		return nil, errors.New("network timeout")
 	}
 
@@ -146,7 +155,7 @@ func TestRun_DaemonModeRunsUntilContextCancelledWithoutEOF(t *testing.T) {
 
 	var mu sync.Mutex
 	fetchCalls := 0
-	fetcher := func(_ string) ([]djinni.Job, error) {
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
 		mu.Lock()
 		fetchCalls++
 		mu.Unlock()
@@ -175,7 +184,7 @@ func TestRunScrapeIteration_SkipsDBErrorAndCancelledContext(t *testing.T) {
 	pub := &fakePublisher{}
 	cfg := testConfig(true)
 
-	fetcher := func(_ string) ([]djinni.Job, error) {
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
 		return []djinni.Job{
 			{GUID: "bad-1", Title: "Broken"},
 			{GUID: "good-1", Title: "Valid"},
@@ -192,5 +201,31 @@ func TestRunScrapeIteration_SkipsDBErrorAndCancelledContext(t *testing.T) {
 	runScrapeIteration(cancelledCtx, cfg, repo, pub, "new_vacancies", fetcher)
 	if len(pub.published) != 1 {
 		t.Fatalf("expected no additional publishes on cancelled ctx, got %+v", pub.published)
+	}
+}
+
+func TestRunScrapeIteration_RollsBackDBRecordOnPublishFailure(t *testing.T) {
+	repo := &fakeRepo{}
+	pub := &fakePublisher{pubErr: errors.New("rabbitmq down")}
+	cfg := testConfig(true)
+
+	fetcher := func(_ context.Context, _ string) ([]djinni.Job, error) {
+		return []djinni.Job{{GUID: "retry-1", Title: "Go Dev"}}, nil
+	}
+
+	runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+
+	if len(repo.deleted) != 1 || repo.deleted[0] != "retry-1" {
+		t.Fatalf("expected rollback delete for retry-1, got %+v", repo.deleted)
+	}
+	if repo.seen["retry-1"] {
+		t.Fatalf("expected retry-1 to be removed from seen set after publish failure")
+	}
+
+	// Next cycle after RabbitMQ recovers should publish retry-1
+	pub.pubErr = nil
+	runScrapeIteration(context.Background(), cfg, repo, pub, "new_vacancies", fetcher)
+	if len(pub.published) != 1 || pub.published[0].GUID != "retry-1" {
+		t.Fatalf("expected retry-1 to be published after recovery, got %+v", pub.published)
 	}
 }

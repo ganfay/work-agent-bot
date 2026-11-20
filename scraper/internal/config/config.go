@@ -1,8 +1,9 @@
 package config
 
 import (
-	"fmt"
 	"log/slog"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
@@ -31,16 +32,27 @@ type Config struct {
 	}
 }
 
-// DSN builds the PostgreSQL connection string
+// DSN builds the PostgreSQL connection string with properly URL-encoded credentials.
 func (c *Config) DSN() string {
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		c.Database.User, c.Database.Password, c.Database.Host, c.Database.Port, c.Database.Name)
+	u := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(c.Database.User, c.Database.Password),
+		Host:     net.JoinHostPort(c.Database.Host, c.Database.Port),
+		Path:     "/" + c.Database.Name,
+		RawQuery: "sslmode=disable",
+	}
+	return u.String()
 }
 
-// URL builds the RabbitMQ connection string
+// URL builds the RabbitMQ connection string with properly URL-encoded credentials.
 func (c *Config) URL() string {
-	return fmt.Sprintf("amqp://%s:%s@%s:%s/",
-		c.RabbitMQ.User, c.RabbitMQ.Password, c.RabbitMQ.Host, c.RabbitMQ.Port)
+	u := &url.URL{
+		Scheme: "amqp",
+		User:   url.UserPassword(c.RabbitMQ.User, c.RabbitMQ.Password),
+		Host:   net.JoinHostPort(c.RabbitMQ.Host, c.RabbitMQ.Port),
+		Path:   "/",
+	}
+	return u.String()
 }
 
 // LoadConfig parses the .env file or reads directly from environment variables

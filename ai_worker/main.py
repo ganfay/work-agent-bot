@@ -21,34 +21,33 @@ logger = setup_logger(settings.log_path)
 
 # 2. Self-healing check: ensure pgvector has codebase embeddings
 def ensure_embeddings_exist():
+    conn = None
     try:
         conn = psycopg2.connect(settings.database_url())
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE EXTENSION IF NOT EXISTS vector;
-            CREATE TABLE IF NOT EXISTS code_embeddings (
-                id SERIAL PRIMARY KEY,
-                project_name VARCHAR(100) NOT NULL,
-                category VARCHAR(50) NOT NULL,
-                content TEXT NOT NULL,
-                embedding vector(768) NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx
-            ON code_embeddings USING hnsw (embedding vector_cosine_ops);
-            CREATE TABLE IF NOT EXISTS user_feedback (
-                id SERIAL PRIMARY KEY,
-                job_title TEXT NOT NULL,
-                reason TEXT NOT NULL,
-                status VARCHAR(20) DEFAULT 'rejected',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.commit()
-        cur.execute("SELECT COUNT(*) FROM code_embeddings;")
-        count = cur.fetchone()[0]
-        cur.close()
-        conn.close()
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE EXTENSION IF NOT EXISTS vector;
+                    CREATE TABLE IF NOT EXISTS code_embeddings (
+                        id SERIAL PRIMARY KEY,
+                        project_name VARCHAR(100) NOT NULL,
+                        category VARCHAR(50) NOT NULL,
+                        content TEXT NOT NULL,
+                        embedding vector(768) NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                    CREATE INDEX IF NOT EXISTS code_embeddings_hnsw_idx
+                    ON code_embeddings USING hnsw (embedding vector_cosine_ops);
+                    CREATE TABLE IF NOT EXISTS user_feedback (
+                        id SERIAL PRIMARY KEY,
+                        job_title TEXT NOT NULL,
+                        reason TEXT NOT NULL,
+                        status VARCHAR(20) DEFAULT 'rejected',
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                cur.execute("SELECT COUNT(*) FROM code_embeddings;")
+                count = cur.fetchone()[0]
         if count == 0:
             logger.warning("[RAG] Vector database is empty! Triggering automatic indexing...")
             index_knowledge_base()
@@ -56,6 +55,9 @@ def ensure_embeddings_exist():
             logger.info(f"[RAG] Vector database initialized with {count} code chunks.")
     except Exception as e:
         logger.error(f"[RAG] Error checking vector database: {e}")
+    finally:
+        if conn is not None:
+            conn.close()
 
 analyzer = None
 validator = None
@@ -149,8 +151,8 @@ def main():
         f"batch_idle_timeout={settings.batch_idle_timeout}s)..."
     )
 
-    ensure_embeddings_exist()
     init_agents()
+    ensure_embeddings_exist()
 
     consumer = RabbitMQConsumer(
         amqp_url=settings.rabbitmq_url(),

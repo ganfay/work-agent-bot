@@ -150,3 +150,14 @@ func TestRunConsumerLoop_DaemonModeIgnoresEOFAndExitsOnCancel(t *testing.T) {
 		t.Fatalf("expected EOF acked in daemon mode too, got %+v", ack.acks)
 	}
 }
+
+func TestRunConsumerLoop_DaemonModeReturnsErrorOnBrokerDisconnect(t *testing.T) {
+	sender := &fakeSender{}
+	msgs := make(chan amqp.Delivery)
+	close(msgs)
+
+	err := runConsumerLoop(context.Background(), msgs, sender, 42, false, time.Second, 0)
+	if !errors.Is(err, errBrokerChannelClosed) {
+		t.Fatalf("expected errBrokerChannelClosed on unexpected close in daemon mode, got %v", err)
+	}
+}

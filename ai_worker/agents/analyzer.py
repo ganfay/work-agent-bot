@@ -15,13 +15,16 @@ from google import genai
 from google.genai import types
 
 from config.config import settings
+from core.llm import call_with_retry
 
 logger = logging.getLogger("ai_worker")
 
 
 class AnalysisResult(BaseModel):
     match_score: int = Field(
-        description="Fit score from 0 to 100 based on candidate profile and job requirements"
+        ge=0,
+        le=100,
+        description="Fit score from 0 to 100 based on candidate profile and job requirements",
     )
     extracted_stack: List[str] = Field(
         description="List of primary technologies and tools required by the job (e.g. Go, PostgreSQL, Docker, gRPC)"
@@ -41,9 +44,9 @@ class AnalysisResult(BaseModel):
 
 
 class VacancyAnalyzer:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model_name: Optional[str] = None):
         self.client = genai.Client(api_key=api_key)
-        self.model_name = "gemini-3.5-flash-lite"
+        self.model_name = model_name or settings.gemini_model
 
         # Завантажуємо базовий профіль із candidate_profile.json
         self.candidate_profile = settings.profile_data.get(
@@ -88,7 +91,7 @@ class VacancyAnalyzer:
         {description}
         """
 
-        try:
+        def _call():
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
@@ -99,20 +102,12 @@ class VacancyAnalyzer:
                     temperature=0.2,
                 ),
             )
+            if not response.text:
+                raise RuntimeError("Gemini Analyzer returned empty response text")
+            return AnalysisResult.model_validate_json(response.text)
 
-            result: AnalysisResult = AnalysisResult.model_validate_json(response.text)
-            logger.info(
-                f"[Analyzer] Evaluated '{title}': Score={result.match_score}/100, Decision={result.decision}"
-            )
-            return result
-
-        except Exception as err:
-            logger.error(f"[Analyzer] Failed to analyze vacancy: {err}", exc_info=True)
-            return AnalysisResult(
-                match_score=0,
-                extracted_stack=[],
-                pros=[],
-                missing_skills=["Analysis execution failed"],
-                decision="SKIP",
-                summary=f"Analysis failed due to error: {err}"
-            )
+        result: AnalysisResult = call_with_retry(_call, operation="VacancyAnalyzer.analyze")
+        logger.info(
+            f"[Analyzer] Evaluated '{title}': Score={result.match_score}/100, Decision={result.decision}"
+        )
+        return result
