@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"html"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -133,6 +134,18 @@ func (p *notifyPoller) Poll(b *tele.Bot, updates chan tele.Update, stop chan str
 	p.inner.Poll(b, updates, stop)
 }
 
+type cancelOnCloseBody struct {
+	io.ReadCloser
+	once    sync.Once
+	cleanup func()
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.cleanup)
+	return err
+}
+
 type cancelUpdatesTransport struct {
 	base    http.RoundTripper
 	pollCtx context.Context
@@ -143,14 +156,25 @@ func (t *cancelUpdatesTransport) RoundTrip(req *http.Request) (*http.Response, e
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	if strings.HasSuffix(req.URL.Path, "/getUpdates") {
-		reqCtx, cancel := context.WithCancel(req.Context())
-		defer cancel()
-		stopWatch := context.AfterFunc(t.pollCtx, cancel)
-		defer stopWatch()
-		req = req.Clone(reqCtx)
+	if !strings.HasSuffix(req.URL.Path, "/getUpdates") {
+		return base.RoundTrip(req)
 	}
-	return base.RoundTrip(req)
+	reqCtx, cancel := context.WithCancel(req.Context())
+	stopWatch := context.AfterFunc(t.pollCtx, cancel)
+	cleanup := func() {
+		stopWatch()
+		cancel()
+	}
+	resp, err := base.RoundTrip(req.Clone(reqCtx))
+	if err != nil || resp == nil || resp.Body == nil {
+		cleanup()
+		return resp, err
+	}
+	resp.Body = &cancelOnCloseBody{
+		ReadCloser: resp.Body,
+		cleanup:    cleanup,
+	}
+	return resp, nil
 }
 
 // FeedbackPublisher publishes user rejection feedback for AI training.

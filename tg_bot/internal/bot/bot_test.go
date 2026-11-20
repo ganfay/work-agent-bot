@@ -2,6 +2,7 @@ package bot
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -616,4 +617,54 @@ func TestBot_EarlyStopCancelsGetUpdatesImmediately(t *testing.T) {
 	if elapsed > 200*time.Millisecond {
 		t.Fatalf("early Stop() took %v, expected < 200ms", elapsed)
 	}
+}
+
+func TestCancelUpdatesTransport_KeepsContextAliveUntilBodyClose(t *testing.T) {
+	pollCtx, pollCancel := context.WithCancel(context.Background())
+	defer pollCancel()
+
+	var bodyCtx context.Context
+	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		bodyCtx = req.Context()
+		pr, pw := io.Pipe()
+		go func() {
+			_, _ = pw.Write([]byte(`{"ok":true,"result":[{"update_id":1}]}`))
+			_ = pw.Close()
+		}()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Body:       pr,
+			Header:     make(http.Header),
+		}, nil
+	})
+
+	tr := &cancelUpdatesTransport{base: rt, pollCtx: pollCtx}
+	req, err := http.NewRequest(http.MethodPost, "http://example.com/bot123/getUpdates", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip: %v", err)
+	}
+	if bodyCtx.Err() != nil {
+		t.Fatalf("expected request context to remain active while reading body, got %v", bodyCtx.Err())
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if !strings.Contains(string(data), `"update_id":1`) {
+		t.Fatalf("unexpected body: %s", string(data))
+	}
+	_ = resp.Body.Close()
+	if bodyCtx.Err() == nil {
+		t.Fatalf("expected request context to be canceled after resp.Body.Close()")
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
 }
