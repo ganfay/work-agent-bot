@@ -24,11 +24,14 @@ _BLOCK_TAGS = frozenset({
 _IGNORED_TAGS = frozenset({"script", "style"})
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_DELIMITER_TAG_NAMES = (
+    r"untrusted_[a-z0-9_]*|learned_feedback|rag_evidence|audited_evidence|system"
+)
 _DELIMITER_TAGS_RE = re.compile(
-    r"</?(?:untrusted_[a-z0-9_]*|learned_feedback|rag_evidence|audited_evidence|system)\b[^>]*>",
+    rf"<\s*/?\s*(?:{_DELIMITER_TAG_NAMES})\b[^>]*>",
     re.IGNORECASE,
 )
-_CREDENTIAL_URL_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/@]+)@")
+_CREDENTIAL_URL_RE = re.compile(r"\b([a-zA-Z][a-zA-Z0-9+.-]*://)([^\s/]+)@")
 
 
 class _HTMLStripper(HTMLParser):
@@ -79,6 +82,20 @@ class _HTMLStripper(HTMLParser):
         return "".join(self._parts)
 
 
+def _strip_tags_iteratively(text: str, pattern: re.Pattern[str]) -> str:
+    """Repeatedly strips matching tags until fixed point to prevent nested reconstruction."""
+    while True:
+        last_gt = text.rfind(">")
+        if last_gt == -1:
+            return text
+        head = text[: last_gt + 1]
+        tail = text[last_gt + 1 :]
+        updated_head = pattern.sub("", head)
+        if updated_head == head:
+            return text
+        text = updated_head + tail
+
+
 def sanitize_text(raw: Any, max_len: int = MAX_DESCRIPTION_LEN, *, single_line: bool = False) -> str:
     """Strips HTML, control chars, and XML delimiter breakouts, then normalizes whitespace and length."""
     if raw is None:
@@ -94,7 +111,7 @@ def sanitize_text(raw: Any, max_len: int = MAX_DESCRIPTION_LEN, *, single_line: 
 
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _CONTROL_CHARS_RE.sub("", text)
-    text = _DELIMITER_TAGS_RE.sub("", text)
+    text = _strip_tags_iteratively(text, _DELIMITER_TAGS_RE)
 
     if single_line:
         text = re.sub(r"\s+", " ", text).strip()
@@ -112,10 +129,17 @@ def sanitize_text(raw: Any, max_len: int = MAX_DESCRIPTION_LEN, *, single_line: 
     return text
 
 
-def wrap_xml(tag: str, content: str) -> str:
+def wrap_xml(tag: str, content: Any) -> str:
     """Wraps content in explicit XML delimiters after neutralizing embedded matching tags."""
     safe_tag = re.sub(r"[^a-zA-Z0-9_]", "", tag) or "data"
-    return f"<{safe_tag}>\n{content}\n</{safe_tag}>"
+    text = "" if content is None else (content if isinstance(content, str) else str(content))
+    text = _CONTROL_CHARS_RE.sub("", text)
+    tag_re = re.compile(
+        rf"<\s*/?\s*(?:{_DELIMITER_TAG_NAMES}|{re.escape(safe_tag)})\b[^>]*>",
+        re.IGNORECASE,
+    )
+    text = _strip_tags_iteratively(text, tag_re)
+    return f"<{safe_tag}>\n{text}\n</{safe_tag}>"
 
 
 def redact_url(text: Any) -> str:
